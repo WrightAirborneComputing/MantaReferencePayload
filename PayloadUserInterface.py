@@ -2,15 +2,25 @@
 """
 GUI H.264/MPEG-TS viewer with side-by-side console.
 
-- Connects to multiple TCP ports (monitor-only for non-display ports).
-- Decodes/display stream from DISPLAY_PORT inside the GUI (no external window).
-- Overlays resolution, FPS (smoothed), codec, and transport info on the video.
-- Redirects stdout/stderr to an on-screen console pane (right side).
-- NEW: Forwards all data from SERVER_IP:7002 to 127.0.0.1:18087.
+SIDE-B PORTS (as expected):
+- HEARTBEAT (text)  UDP :6001
+- VIDEO (mpegts)    UDP :7001
+- COT (xml/text)    UDP :8001
+
+This version:
+- STRIPS ALL UDP WAKEUP CODE
+- DELETES THE SNIFFER
+- PRINTS immediately when data is received on ANY port
+- FIXES Windows PyAV UDP open errors (Errno 10014) by NOT using av.open("udp://...").
+  Instead:
+    - a Python UDP socket binds to :7001
+    - received MPEG-TS datagrams are fed into PyAV via a file-like reader.
+
+Requires:
+  pip install pyqt5 av opencv-python numpy
 """
 
 import sys
-import os
 import socket
 import threading
 import time
@@ -19,32 +29,31 @@ from datetime import datetime
 from typing import Optional
 
 # --- Third-party ---
-# pip install pyqt5 av opencv-python numpy
 import av
 import numpy as np
 import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # ------------------ Config ------------------
-SERVER_IP = "192.168.144.11"
+# Side-B ports
+HEARTBEAT_UDP_PORT = 6001   # status text
+VIDEO_UDP_PORT     = 7001   # H.264 in MPEG-TS over UDP
+COT_UDP_PORT       = 8001   # Cursor-on-Target XML (or any text)
 
-# Ports to monitor (stdout preview only). We EXCLUDE 7002 so the forwarder can own it.
-TCP_PORTS = [7000, 7001]
+# Bind host (0.0.0.0 to listen on all interfaces)
+UDP_LISTEN_HOST = "192.168.43.74"
 
-# Port that carries H.264-in-MPEGTS we want to view in the GUI.
-DISPLAY_PORT = 7001
-
-# Forward 7002 -> localhost:18087
-FORWARD_SRC_PORT = 7002
-FORWARD_DST_HOST = "127.0.0.1"
-FORWARD_DST_PORT = 18087
+# UDP buffer
+UDP_MAX_DGRAM = 65535
 
 WINDOW_TITLE = "MPEG-TS Viewer + Console"
 INITIAL_WIN_W, INITIAL_WIN_H = 1200, 700
 
+
 # --------------- Utilities ------------------
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def safe_preview(b: bytes, max_len: int = 200) -> str:
     try:
@@ -55,7 +64,8 @@ def safe_preview(b: bytes, max_len: int = 200) -> str:
         s = s[:max_len] + f"...(+{len(s)-max_len} more)"
     return s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
 
-# ---------- Qt console redirection ----------
+
+# ---------- Qt console redirection (optional) ----------
 class EmittingStream(QtCore.QObject):
     text_ready = QtCore.pyqtSignal(str)
 
@@ -65,6 +75,7 @@ class EmittingStream(QtCore.QObject):
 
     def flush(self):
         pass
+
 
 class ConsoleWidget(QtWidgets.QTextEdit):
     def __init__(self, parent=None):
@@ -82,6 +93,7 @@ class ConsoleWidget(QtWidgets.QTextEdit):
         self.moveCursor(QtGui.QTextCursor.End)
         self.insertPlainText(text)
         self.moveCursor(QtGui.QTextCursor.End)
+
 
 # -------------- Video display ---------------
 class VideoWidget(QtWidgets.QLabel):
@@ -106,14 +118,117 @@ class VideoWidget(QtWidgets.QLabel):
             self.setPixmap(pm.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
         super().resizeEvent(event)
 
+
+# ---------- Video UDP -> file-like reader ----------
+class UDPBytePipe:
+    """
+    Thread-safe byte buffer that provides a blocking .read(n) method,
+    so PyAV/FFmpeg can read MPEG-TS bytes from it like a file.
+    """
+    def __init__(self, stop_event: threading.Event):
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._stop_event = stop_event
+        self._closed = False
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+    def push(self, data: bytes):
+        if not data:
+            return
+        with self._cv:
+            self._buf.extend(data)
+            self._cv.notify_all()
+
+    def readable(self):
+        return True
+
+    def read(self, n: int) -> bytes:
+        # PyAV/FFmpeg will call read() repeatedly.
+        with self._cv:
+            while not self._stop_event.is_set() and not self._closed and len(self._buf) == 0:
+                self._cv.wait(timeout=0.5)
+
+            if self._stop_event.is_set() or self._closed:
+                # Signal EOF
+                return b""
+
+            # Return up to n bytes
+            take = min(max(1, int(n)), len(self._buf))
+            out = bytes(self._buf[:take])
+            del self._buf[:take]
+            return out
+
+
+def udp_video_receiver(stop_event: threading.Event, pipe: UDPBytePipe, listen_host: str, listen_port: int):
+    """
+    Binds UDP :7001 and pushes MPEG-TS datagrams into pipe for PyAV.
+    Also prints immediately when datagrams arrive.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        sock.bind((listen_host, int(listen_port)))
+    except Exception as e:
+        print(f"[{ts()}] [VIDEO] Bind failed on {listen_host}:{listen_port}: {e}")
+        try:
+            sock.close()
+        except Exception:
+            pass
+        pipe.close()
+        return
+
+    print(f"[{ts()}] [VIDEO] Listening on {listen_host}:{listen_port} (raw UDP). Feeding decoder...")
+
+    sock.settimeout(0.5)
+    first = True
+    try:
+        while not stop_event.is_set():
+            try:
+                data, peer = sock.recvfrom(UDP_MAX_DGRAM)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                print(f"[{ts()}] [VIDEO] recv error: {e}")
+                break
+
+            if not data:
+                continue
+
+            # Straight print on receive:
+            if first:
+                first = False
+                print(f"[{ts()}] [VIDEO] <<< first datagram {len(data)}B from {peer[0]}:{peer[1]}")
+            else:
+                print(f"[{ts()}] [VIDEO] <<< {len(data)}B from {peer[0]}:{peer[1]}")
+
+            pipe.push(data)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        pipe.close()
+        print(f"[{ts()}] [VIDEO] Stopped.")
+
+
 # --------- Decoder thread (PyAV) ------------
 class DecoderThread(QtCore.QThread):
-    frame_ready = QtCore.pyqtSignal(np.ndarray)   # emits BGR image
+    frame_ready = QtCore.pyqtSignal(np.ndarray)  # emits BGR image
 
-    def __init__(self, host: str, port: int, parent=None):
+    def __init__(self, pipe: UDPBytePipe, parent=None, label: str = ""):
         super().__init__(parent)
-        self.host = host
-        self.port = port
+        self.pipe = pipe
+        self.label = label
         self._stop = threading.Event()
 
         self._ts_window = deque(maxlen=90)
@@ -122,8 +237,35 @@ class DecoderThread(QtCore.QThread):
         self._height: Optional[int] = None
         self._codec: str = "unknown"
 
+        # instrumentation (demux packet stats)
+        self._rx_packets = 0
+        self._rx_bytes = 0
+        self._rx_last_log = time.time()
+        self._rx_first_seen = False
+        self._rx_last_size = 0
+
     def stop(self):
         self._stop.set()
+
+    def _log_rx_if_needed(self, packet_size: int):
+        now = time.time()
+        self._rx_packets += 1
+        self._rx_bytes += int(packet_size)
+        self._rx_last_size = int(packet_size)
+
+        if not self._rx_first_seen:
+            self._rx_first_seen = True
+            print(f"[{ts()}] [DECODE] first demuxed packet (size={self._rx_last_size}B)")
+
+        dt = now - self._rx_last_log
+        if dt >= 1.0:
+            pps = self._rx_packets / dt
+            bps = self._rx_bytes / dt
+            kbps = (bps * 8.0) / 1000.0
+            print(f"[{ts()}] [DECODE] {pps:.1f} packets/s, {kbps:.1f} kbps, last={self._rx_last_size}B")
+            self._rx_packets = 0
+            self._rx_bytes = 0
+            self._rx_last_log = now
 
     def _draw_overlay(self, img: np.ndarray) -> np.ndarray:
         h, w = img.shape[:2]
@@ -141,7 +283,7 @@ class DecoderThread(QtCore.QThread):
         fps_rt_text = f"{rt_fps:.2f} fps" if rt_fps else "estimating..."
         info_line = f"Frame rate: {fps_rt_text} (nominal: {fps_nom_text})"
         codec_text = f"Codec: {self._codec}"
-        label_text = f"H.264 / MPEG-TS / TCP  @ {self.host}:{self.port}"
+        label_text = self.label or "MPEG-TS via UDPBytePipe"
 
         lines = [res_text, info_line, codec_text, label_text]
 
@@ -163,19 +305,20 @@ class DecoderThread(QtCore.QThread):
         return img
 
     def run(self):
-        url = f"tcp://{self.host}:{self.port}"
-        print(f"[{ts()}] [DECODE] Opening {url} (mpegts, h264)...")
+        print(f"[{ts()}] [DECODE] Opening PyAV container from UDPBytePipe (mpegts, h264)...")
         try:
-            container = av.open(url, format="mpegts", timeout=None)
+            container = av.open(self.pipe, format="mpegts")
         except Exception as e:
-            print(f"[{ts()}] [DECODE] Failed to open: {e}\n")
+            print(f"[{ts()}] [DECODE] Failed to open from pipe: {e}")
             return
 
         video_stream = next((s for s in container.streams if s.type == "video"), None)
         if not video_stream:
             print(f"[{ts()}] [DECODE] No video stream found.")
-            try: container.close()
-            except Exception: pass
+            try:
+                container.close()
+            except Exception:
+                pass
             return
 
         try:
@@ -203,6 +346,12 @@ class DecoderThread(QtCore.QThread):
                 if packet.stream.type != "video":
                     continue
 
+                # demux instrumentation
+                try:
+                    self._log_rx_if_needed(packet.size or 0)
+                except Exception:
+                    pass
+
                 for frame in packet.decode():
                     if self._stop.is_set():
                         break
@@ -212,8 +361,8 @@ class DecoderThread(QtCore.QThread):
 
                     img = frame.to_ndarray(format="bgr24")
                     img = self._draw_overlay(img)
-
                     self.frame_ready.emit(img)
+
         except av.error.ExitError as e:
             print(f"[{ts()}] [DECODE] FFmpeg/AV exit: {e}")
         except Exception as e:
@@ -225,88 +374,58 @@ class DecoderThread(QtCore.QThread):
                 pass
             print(f"[{ts()}] [DECODE] Stopped.")
 
-# ---------- TCP monitor threads -------------
-def tcp_listener(stop_event: threading.Event, host: str, port: int, display: bool = False):
-    if display:
+
+# ---------- Straight UDP text listeners ----------
+def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int):
+    """
+    Binds UDP :listen_port and prints received datagrams (safe preview).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        sock.bind((UDP_LISTEN_HOST, int(listen_port)))
+    except Exception as e:
+        print(f"[{ts()}] [{label}] Bind failed on {UDP_LISTEN_HOST}:{listen_port}: {e}")
+        try:
+            sock.close()
+        except Exception:
+            pass
         return
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    print(f"[{ts()}] [TCP:{port}] Connecting to {host}:{port}...")
-    try:
-        sock.connect((host, port))
-    except Exception as e:
-        print(f"[{ts()}] [TCP:{port}] Connection failed: {e}")
-        return
-    print(f"[{ts()}] [TCP:{port}] Connected. Listening for data...")
+    print(f"[{ts()}] [{label}] Listening on {UDP_LISTEN_HOST}:{listen_port}")
+    sock.settimeout(0.5)
 
     try:
         while not stop_event.is_set():
-            data = sock.recv(65536)
-            if not data:
-                print(f"[{ts()}] [TCP:{port}] Server closed connection.")
-                break
-            print(f"[{ts()}] [TCP:{port}] >>> {len(data)} bytes [{safe_preview(data)}]")
-    except Exception as e:
-        print(f"[{ts()}] [TCP:{port}] Error: {e}")
-    finally:
-        try: sock.close()
-        except Exception: pass
-        print(f"[{ts()}] [TCP:{port}] Disconnected.")
-
-# ---------- TCP forwarder (7002 -> 127.0.0.1:18087) ----------
-def tcp_forwarder(stop_event: threading.Event, src_host: str, src_port: int,
-                  dst_host: str, dst_port: int, reconnect_delay_s: float = 2.0):
-    """
-    One-way forwarder: read from (src_host, src_port) and send to (dst_host, dst_port).
-    Reconnects on errors until stop_event is set.
-    """
-    print(f"[{ts()}] [FWD] Starting forwarder {src_host}:{src_port}  -->  {dst_host}:{dst_port}")
-
-    while not stop_event.is_set():
-        src = None
-        dst = None
-        try:
-            # Connect source
-            src = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            src.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"[{ts()}] [FWD] Connecting to source {src_host}:{src_port} ...")
-            src.connect((src_host, src_port))
-            print(f"[{ts()}] [FWD] Source connected.")
-
-            # Connect destination
-            dst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            dst.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            print(f"[{ts()}] [FWD] Connecting to destination {dst_host}:{dst_port} ...")
-            dst.connect((dst_host, dst_port))
-            print(f"[{ts()}] [FWD] Destination connected. Forwarding data...")
-
-            total = 0
-            while not stop_event.is_set():
-                chunk = src.recv(65536)
-                if not chunk:
-                    print(f"[{ts()}] [FWD] Source closed connection.")
+            try:
+                data, peer = sock.recvfrom(UDP_MAX_DGRAM)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if stop_event.is_set():
                     break
-                print(f"[{ts()}] [Fwd: {len(chunk)} bytes [{safe_preview(chunk)}]")
-                dst.sendall(chunk)
-                total += len(chunk)
-        except Exception as e:
-            print(f"[{ts()}] [FWD] Error: {e}")
-        finally:
-            if dst:
-                try: dst.close()
-                except Exception: pass
-            if src:
-                try: src.close()
-                except Exception: pass
-            if not stop_event.is_set():
-                print(f"[{ts()}] [FWD] Reconnecting in {reconnect_delay_s:.1f}s...")
-                time.sleep(reconnect_delay_s)
+                print(f"[{ts()}] [{label}] recv error: {e}")
+                break
 
-    print(f"[{ts()}] [FWD] Forwarder stopped.")
+            if not data:
+                continue
+
+            # Straight print on receive:
+            print(f"[{ts()}] [{label}] <<< {peer[0]}:{peer[1]}  {len(data)}B [{safe_preview(data)}]")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        print(f"[{ts()}] [{label}] Stopped.")
+
 
 # -------------- Main window ----------------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, host: str, ports: list[int], display_port: int):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self.resize(INITIAL_WIN_W, INITIAL_WIN_H)
@@ -316,38 +435,49 @@ class MainWindow(QtWidgets.QMainWindow):
         outer_vbox.setContentsMargins(8, 8, 8, 8)
         outer_vbox.setSpacing(8)
 
-        # Header
         header = QtWidgets.QLabel(
-            f"<b>Server:</b> {host} | <b>Display Port:</b> {display_port} | "
-            f"<b>Monitors:</b> {', '.join(map(str, ports))} | "
-            f"<b>Forward:</b> {host}:{FORWARD_SRC_PORT} → {FORWARD_DST_HOST}:{FORWARD_DST_PORT}"
+            f"<b>Listening (side-B):</b> "
+            f"HB UDP {UDP_LISTEN_HOST}:{HEARTBEAT_UDP_PORT} | "
+            f"Video UDP {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT} | "
+            f"CoT UDP {UDP_LISTEN_HOST}:{COT_UDP_PORT}"
         )
         outer_vbox.addWidget(header)
 
-        # Splitter (horizontal): left = video, right = console
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
-        # Left: Video group
-        video_group = QtWidgets.QGroupBox("Video")
+        video_group = QtWidgets.QGroupBox("Video (H.264 / MPEG-TS)")
         video_layout = QtWidgets.QVBoxLayout(video_group)
         self.video_widget = VideoWidget()
         video_layout.addWidget(self.video_widget)
         splitter.addWidget(video_group)
 
-        # Right: Console group
         console_group = QtWidgets.QGroupBox("Console (stdout / stderr)")
         console_layout = QtWidgets.QVBoxLayout(console_group)
         self.console = ConsoleWidget()
         console_layout.addWidget(self.console)
         splitter.addWidget(console_group)
 
-        # Initial sizes and stretch
-        splitter.setStretchFactor(0, 3)  # video gets more space
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([int(INITIAL_WIN_W * 0.65), int(INITIAL_WIN_W * 0.35)])
 
         outer_vbox.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
+
+        # Threads + stop
+        self.stop_event = threading.Event()
+        self.threads: list[threading.Thread] = []
+
+        # --- Video pipeline: UDP receiver -> pipe -> decoder ---
+        self.video_pipe = UDPBytePipe(self.stop_event)
+
+        vt = threading.Thread(
+            target=udp_video_receiver,
+            args=(self.stop_event, self.video_pipe, UDP_LISTEN_HOST, VIDEO_UDP_PORT),
+            daemon=True
+        )
+        vt.start()
+        self.threads.append(vt)
 
         # Redirect stdout/stderr
         self.stdout_stream = EmittingStream()
@@ -357,36 +487,46 @@ class MainWindow(QtWidgets.QMainWindow):
         sys.stdout = self.stdout_stream  # type: ignore
         sys.stderr = self.stderr_stream  # type: ignore
 
-        # Start decoder thread for display port
-        self.decoder = DecoderThread(host, display_port, parent=self)
+        self.decoder = DecoderThread(
+            self.video_pipe,
+            parent=self,
+            label=f"MPEG-TS over UDP (bound {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT})",
+        )
         self.decoder.frame_ready.connect(self.video_widget.set_frame)
         self.decoder.start()
 
-        # Start TCP monitor threads for non-display ports
-        self.stop_event = threading.Event()
-        self.threads: list[threading.Thread] = []
-        for p in ports:
-            t = threading.Thread(target=tcp_listener, args=(self.stop_event, host, p, p == display_port), daemon=True)
-            t.start()
-            self.threads.append(t)
-
-        # Start the forwarder (SERVER_IP:7002 -> 127.0.0.1:18087)
-        fwd = threading.Thread(
-            target=tcp_forwarder,
-            args=(self.stop_event, host, FORWARD_SRC_PORT, FORWARD_DST_HOST, FORWARD_DST_PORT),
+        # --- HEARTBEAT listener on :6001 ---
+        hb_t = threading.Thread(
+            target=udp_text_listener,
+            args=(self.stop_event, "HEARTBEAT", HEARTBEAT_UDP_PORT),
             daemon=True
         )
-        fwd.start()
-        self.threads.append(fwd)
+        hb_t.start()
+        self.threads.append(hb_t)
+
+        # --- COT listener on :8001 ---
+        cot_t = threading.Thread(
+            target=udp_text_listener,
+            args=(self.stop_event, "COT", COT_UDP_PORT),
+            daemon=True
+        )
+        cot_t.start()
+        self.threads.append(cot_t)
 
         print(f"[{ts()}] UI ready. Close the window to quit.\n")
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
+            self.stop_event.set()
+            try:
+                self.video_pipe.close()
+            except Exception:
+                pass
+
             if self.decoder.isRunning():
                 self.decoder.stop()
                 self.decoder.wait(2000)
-            self.stop_event.set()
+
             for t in self.threads:
                 t.join(timeout=1.0)
         except Exception:
@@ -396,14 +536,15 @@ class MainWindow(QtWidgets.QMainWindow):
             sys.stderr = sys.__stderr__
         super().closeEvent(event)
 
+
 # ------------------ Entry -------------------
 def main():
-    # High-DPI friendliness
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow(SERVER_IP, TCP_PORTS, DISPLAY_PORT)
+    win = MainWindow()
     win.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
