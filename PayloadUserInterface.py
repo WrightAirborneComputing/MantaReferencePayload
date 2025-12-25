@@ -5,7 +5,7 @@ GUI H.264/MPEG-TS viewer with side-by-side console.
 SIDE-B PORTS (as expected):
 - HEARTBEAT (text)  UDP :6001
 - VIDEO (mpegts)    UDP :7001
-- COT (xml/text)    UDP :8001
+- COT (xml/text)    UDP :8001   ---> forwarded to TCP 127.0.0.1:18087
 
 This version:
 - STRIPS ALL UDP WAKEUP CODE
@@ -15,6 +15,8 @@ This version:
   Instead:
     - a Python UDP socket binds to :7001
     - received MPEG-TS datagrams are fed into PyAV via a file-like reader.
+- NEW: Connects to TCP server at 127.0.0.1:18087 and forwards any datagrams
+  arriving on COT_UDP_PORT to that TCP connection (with auto-reconnect).
 
 Requires:
   pip install pyqt5 av opencv-python numpy
@@ -42,6 +44,10 @@ COT_UDP_PORT       = 8001   # Cursor-on-Target XML (or any text)
 
 # Bind host (0.0.0.0 to listen on all interfaces)
 UDP_LISTEN_HOST = "192.168.43.74"
+
+# TCP target for forwarding COT
+COT_TCP_HOST = "127.0.0.1"
+COT_TCP_PORT = 18087
 
 # UDP buffer
 UDP_MAX_DGRAM = 65535
@@ -148,16 +154,13 @@ class UDPBytePipe:
         return True
 
     def read(self, n: int) -> bytes:
-        # PyAV/FFmpeg will call read() repeatedly.
         with self._cv:
             while not self._stop_event.is_set() and not self._closed and len(self._buf) == 0:
                 self._cv.wait(timeout=0.5)
 
             if self._stop_event.is_set() or self._closed:
-                # Signal EOF
                 return b""
 
-            # Return up to n bytes
             take = min(max(1, int(n)), len(self._buf))
             out = bytes(self._buf[:take])
             del self._buf[:take]
@@ -204,12 +207,11 @@ def udp_video_receiver(stop_event: threading.Event, pipe: UDPBytePipe, listen_ho
             if not data:
                 continue
 
-            # Straight print on receive:
             if first:
                 first = False
                 print(f"[{ts()}] [VIDEO] <<< first datagram {len(data)}B from {peer[0]}:{peer[1]}")
-            else:
-                print(f"[{ts()}] [VIDEO] <<< {len(data)}B from {peer[0]}:{peer[1]}")
+            # else:
+            #     print(f"[{ts()}] [VIDEO] <<< {len(data)}B from {peer[0]}:{peer[1]}")
 
             pipe.push(data)
     finally:
@@ -237,7 +239,6 @@ class DecoderThread(QtCore.QThread):
         self._height: Optional[int] = None
         self._codec: str = "unknown"
 
-        # instrumentation (demux packet stats)
         self._rx_packets = 0
         self._rx_bytes = 0
         self._rx_last_log = time.time()
@@ -346,7 +347,6 @@ class DecoderThread(QtCore.QThread):
                 if packet.stream.type != "video":
                     continue
 
-                # demux instrumentation
                 try:
                     self._log_rx_if_needed(packet.size or 0)
                 except Exception:
@@ -413,11 +413,136 @@ def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int)
             if not data:
                 continue
 
-            # Straight print on receive:
             print(f"[{ts()}] [{label}] <<< {peer[0]}:{peer[1]}  {len(data)}B [{safe_preview(data)}]")
     finally:
         try:
             sock.close()
+        except Exception:
+            pass
+        print(f"[{ts()}] [{label}] Stopped.")
+
+
+# ---------- UDP COT -> TCP forwarder ----------
+def udp_to_tcp_forwarder(
+    stop_event: threading.Event,
+    label: str,
+    udp_host: str,
+    udp_port: int,
+    tcp_host: str,
+    tcp_port: int,
+):
+    """
+    Listen on UDP (udp_host:udp_port). For every datagram:
+      - print immediately
+      - forward raw bytes to a TCP server (tcp_host:tcp_port) via sendall()
+    Auto-reconnects TCP on failure.
+    """
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        udp_sock.bind((udp_host, int(udp_port)))
+    except Exception as e:
+        print(f"[{ts()}] [{label}] UDP bind failed on {udp_host}:{udp_port}: {e}")
+        try:
+            udp_sock.close()
+        except Exception:
+            pass
+        return
+
+    udp_sock.settimeout(0.5)
+    print(f"[{ts()}] [{label}] Listening on UDP {udp_host}:{udp_port} and forwarding to TCP {tcp_host}:{tcp_port}")
+
+    tcp_sock: Optional[socket.socket] = None
+    last_connect_log = 0.0
+
+    def tcp_close():
+        nonlocal tcp_sock
+        if tcp_sock is not None:
+            try:
+                tcp_sock.close()
+            except Exception:
+                pass
+        tcp_sock = None
+
+    def tcp_ensure_connected() -> bool:
+        nonlocal tcp_sock, last_connect_log
+        if tcp_sock is not None:
+            return True
+
+        now = time.time()
+        # avoid spamming logs if server is down
+        if now - last_connect_log > 1.0:
+            print(f"[{ts()}] [{label}] TCP connecting to {tcp_host}:{tcp_port}...")
+            last_connect_log = now
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        try:
+            s.connect((tcp_host, int(tcp_port)))
+        except Exception as e:
+            try:
+                s.close()
+            except Exception:
+                pass
+            # Keep trying in the main loop
+            return False
+
+        # Connected
+        try:
+            s.settimeout(None)  # blocking for sendall
+        except Exception:
+            pass
+
+        tcp_sock = s
+        print(f"[{ts()}] [{label}] TCP connected to {tcp_host}:{tcp_port}")
+        return True
+
+    try:
+        while not stop_event.is_set():
+            try:
+                data, peer = udp_sock.recvfrom(UDP_MAX_DGRAM)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                print(f"[{ts()}] [{label}] UDP recv error: {e}")
+                break
+
+            if not data:
+                continue
+
+            # Print immediately on receive
+            print(f"[{ts()}] [{label}] <<< {peer[0]}:{peer[1]}  {len(data)}B [{safe_preview(data)}]")
+
+            # Forward to TCP
+            if not tcp_ensure_connected():
+                # No TCP yet; drop this packet (or you could buffer if you prefer)
+                print(f"[{ts()}] [{label}] TCP not connected; dropped {len(data)}B")
+                continue
+
+            try:
+                tcp_sock.sendall(data)  # type: ignore[union-attr]
+            except Exception as e:
+                print(f"[{ts()}] [{label}] TCP send failed ({e}); reconnecting...")
+                tcp_close()
+                # Try once more immediately (optional)
+                if tcp_ensure_connected():
+                    try:
+                        tcp_sock.sendall(data)  # type: ignore[union-attr]
+                    except Exception as e2:
+                        print(f"[{ts()}] [{label}] TCP re-send failed ({e2}); dropped {len(data)}B")
+                        tcp_close()
+                else:
+                    print(f"[{ts()}] [{label}] TCP reconnect failed; dropped {len(data)}B")
+
+    finally:
+        tcp_close()
+        try:
+            udp_sock.close()
         except Exception:
             pass
         print(f"[{ts()}] [{label}] Stopped.")
@@ -439,7 +564,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"<b>Listening (side-B):</b> "
             f"HB UDP {UDP_LISTEN_HOST}:{HEARTBEAT_UDP_PORT} | "
             f"Video UDP {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT} | "
-            f"CoT UDP {UDP_LISTEN_HOST}:{COT_UDP_PORT}"
+            f"CoT UDP {UDP_LISTEN_HOST}:{COT_UDP_PORT} "
+            f"&rarr; TCP {COT_TCP_HOST}:{COT_TCP_PORT}"
         )
         outer_vbox.addWidget(header)
 
@@ -504,10 +630,10 @@ class MainWindow(QtWidgets.QMainWindow):
         hb_t.start()
         self.threads.append(hb_t)
 
-        # --- COT listener on :8001 ---
+        # --- COT forwarder: UDP :8001 -> TCP 127.0.0.1:18087 ---
         cot_t = threading.Thread(
-            target=udp_text_listener,
-            args=(self.stop_event, "COT", COT_UDP_PORT),
+            target=udp_to_tcp_forwarder,
+            args=(self.stop_event, "COT", UDP_LISTEN_HOST, COT_UDP_PORT, COT_TCP_HOST, COT_TCP_PORT),
             daemon=True
         )
         cot_t.start()
