@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-BridgeAgent.py  (UDP version)
+PayloadAgent.py  (UDP version)
 
-Modified from your original so that Heartbeat, Video, and CoT are sent to
-UDP ports on side-A.
+Now:
+- UDP:6000 is now the "Video Control" channel:
+- VIDEO stream (MPEG-TS over UDP) still goes to UDP:7000
+- CoT goes to UDP:8000
+- STATUS is sent to UDP:9000
 
-Side-A IP (receiver): 10.42.0.126
-Ports used (UDP):
-  - HEARTBEAT_PORT = 6000
-  - VIDEO_PORT     = 7000   (MPEG-TS over UDP)
-  - COT_PORT       = 8000   (CoT XML lines over UDP)
-
-Notes:
-- This removes TCP connection logic for HB/CoT (UDP is connectionless).
-- FFmpeg output URL is now udp://... instead of tcp://...
-- Adds lightweight instrumentation: prints bytes sent + destination.
+Side-A IP (receiver): 192.168.144.11
+Gateway IP (reachability ping): 192.168.144.10
 """
 
 import os
@@ -27,8 +22,7 @@ import shutil
 import threading
 import subprocess
 import shlex
-import select
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 from datetime import datetime, timedelta, timezone
 
 # ---------- Network & device config ----------
@@ -36,9 +30,10 @@ SIDE_A_IP        = "192.168.144.11"      # Side-A receiver
 GATEWAY_IP       = "192.168.144.10"      # Herelink Air Unit (reachability ping)
 IFACE            = "eth0"                # interface to bounce on faults
 
-HEARTBEAT_PORT = 6000                   # UDP heartbeat
-VIDEO_PORT     = 7000                   # UDP video (mpegts)
-COT_PORT       = 8000                   # UDP CoT
+VIDEO_CTRL_PORT  = 6000                  # UDP video control ONLY (rx only)
+VIDEO_PORT       = 7000                  # UDP video (mpegts)
+COT_PORT         = 8000                  # UDP CoT
+HEARTBEAT_PORT   = 9000                  # UDP heartbeat
 
 # ---------- Video settings (optimised for Pi but using MJPEG input) ----------
 FRAME_WIDTH      = 640
@@ -129,7 +124,6 @@ class UdpSender:
     def __init__(self, dest_ip: str, dest_port: int, bind_ip: str = "0.0.0.0", bind_port: int = 0) -> None:
         self.dest = (dest_ip, int(dest_port))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Binding is optional, but helps if you want a stable source port; we default to ephemeral.
         self.sock.bind((bind_ip, int(bind_port)))
 
         self._lock = threading.Lock()
@@ -153,15 +147,14 @@ class UdpSender:
                 self._bytes += n
                 self._pkts += 1
                 dt = now - self._t0
-                # Print a short per-packet line + a rolling average every ~2s
-                preview = data[:80]
-                preview_txt = preview.decode("utf-8", errors="replace").replace("\n", "\\n")
-                print(f"[UDP {label}] -> {self.dest[0]}:{self.dest[1]}  bytes={n}  head='{preview_txt}'")
+                # preview = data[:80]
+                # preview_txt = preview.decode("utf-8", errors="replace").replace("\n", "\\n")
+                # print(f"[UDP {label}] -> {self.dest[0]}:{self.dest[1]}  bytes={n}  head='{preview_txt}'")
 
                 if dt >= 2.0:
-                    bps = self._bytes / dt
-                    pps = self._pkts / dt
-                    print(f"[UDP {label}] STATS {self.dest[0]}:{self.dest[1]}  {bps:.0f} B/s  {pps:.1f} pkt/s  over {dt:.1f}s")
+                    # bps = self._bytes / dt
+                    # pps = self._pkts / dt
+                    # print(f"[UDP {label}] STATS {self.dest[0]}:{self.dest[1]}  {bps:.0f} B/s  {pps:.1f} pkt/s  over {dt:.1f}s")
                     self._bytes = 0
                     self._pkts = 0
                     self._t0 = now
@@ -223,7 +216,7 @@ class PayloadStatusSource:
 
         while not self._stop.is_set():
             try:
-                msg = f"Hello world {self._counter}\n".encode("utf-8")
+                msg = f"Test {self._counter}\n".encode("utf-8")
                 self._udp.send(msg, label="HB")
                 self._counter += 1
             except Exception as e:
@@ -233,6 +226,223 @@ class PayloadStatusSource:
 
             if self._stop.wait(self.interval_s):
                 break
+
+# ---------- Video / FFmpeg wrapper ----------
+class VideoStreamer:
+    """
+    Owns:
+      - ffmpeg command build/launch/stop
+      - local listener on UDP:VIDEO_CTRL_PORT for incoming control commands (raw bytes for now)
+
+    NOTE:
+      - VIDEO_CTRL_PORT is RX-only (no status transmission).
+    """
+    def __init__(
+        self,
+        video_port: int,
+        ctrl_port: int,
+        width: int,
+        height: int,
+        fps: int,
+        bitrate_bps: int,
+        v4l2_device: str,
+        input_format: str,
+        side_a_ip: str,
+        on_control: Optional[Callable[[bytes, tuple[str, int]], None]] = None,
+    ) -> None:
+        self.side_a_ip = side_a_ip
+        self.video_port = int(video_port)
+        self.ctrl_port = int(ctrl_port)
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = int(fps)
+        self.bitrate_bps = int(bitrate_bps)
+        self.v4l2_device = v4l2_device
+        self.input_format = input_format
+        self.on_control = on_control
+
+        self._ff: Optional[subprocess.Popen] = None
+        self._stop = threading.Event()
+
+        # RX-only control socket (bound local :ctrl_port)
+        self._ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self._ctrl_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except Exception:
+            pass
+        self._ctrl_sock.bind(("0.0.0.0", self.ctrl_port))
+
+        self._last_cmd: Optional[bytes] = None
+        self._last_cmd_from: Optional[tuple[str, int]] = None
+        self._restart_count = 0
+        self._last_exit_code: Optional[int] = None
+        self._encoder_in_use: str = "unknown"
+
+        self._rx_thread: Optional[threading.Thread] = None
+
+    def close(self) -> None:
+        try:
+            self._ctrl_sock.close()
+        except Exception:
+            pass
+
+    # ---- camera helpers ----
+    @staticmethod
+    def _have_cmd(name: str) -> bool:
+        return shutil.which(name) is not None
+
+    @staticmethod
+    def _run_cmd(cmd: list[str]) -> int:
+        try:
+            return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode
+        except Exception:
+            return 1
+
+    def _try_set_camera_parm(self) -> None:
+        if self._have_cmd("v4l2-ctl"):
+            self._run_cmd(["v4l2-ctl", "-d", self.v4l2_device, "--set-parm", str(self.fps)])
+
+    def _build_ffmpeg_cmd(self, encoder: str) -> list[str]:
+        # Common TS-over-UDP packet sizing. Also set a UDP socket buffer to reduce drops.
+        url = f"udp://{self.side_a_ip}:{self.video_port}?pkt_size=1316&buffer_size=1048576"
+
+        v4l2_input = [
+            "-f", "v4l2",
+            "-input_format", self.input_format,
+            "-video_size", f"{self.width}x{self.height}",
+            "-framerate", str(self.fps),
+            "-i", self.v4l2_device,
+        ]
+
+        if encoder == "h264_v4l2m2m":
+            enc = [
+                "-c:v", "h264_v4l2m2m",
+                "-pix_fmt", "nv12",
+                "-b:v", str(self.bitrate_bps),
+                "-maxrate", str(self.bitrate_bps),
+                "-bufsize", str(self.bitrate_bps // 2),
+                "-g", str(max(2, self.fps) * 2),
+                "-bf", "0",
+            ]
+        else:
+            enc = [
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-threads", "2",
+                "-pix_fmt", "yuv420p",
+                "-b:v", str(self.bitrate_bps),
+                "-maxrate", str(self.bitrate_bps),
+                "-bufsize", str(self.bitrate_bps // 2),
+                "-g", str(max(2, self.fps) * 2),
+            ]
+
+        base = [
+            "ffmpeg", "-hide_banner", "-loglevel", "warning",
+            "-rtbufsize", "32M",
+            "-thread_queue_size", "256",
+            *v4l2_input,
+            *enc,
+            "-vsync", "cfr",
+            "-r", str(self.fps),
+            "-an",
+            "-f", "mpegts",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            url,
+        ]
+
+        prio = (["nice", "-n", "10", "ionice", "-c2", "-n", "7"]
+                if self._have_cmd("nice") and self._have_cmd("ionice") else [])
+        return prio + base
+
+    # ---- lifecycle ----
+    def start(self) -> None:
+        if self._rx_thread and self._rx_thread.is_alive():
+            return
+        self._stop.clear()
+
+        self._rx_thread = threading.Thread(target=self._rx_loop, name="VideoCtrlRx", daemon=True)
+        self._rx_thread.start()
+
+        # Launch ffmpeg initially
+        self.ensure_running()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.stop_ffmpeg()
+        if self._rx_thread:
+            self._rx_thread.join(timeout=1.0)
+
+    def ensure_running(self) -> None:
+        if self._ff is None or self._ff.poll() is not None:
+            if self._ff is not None:
+                self._last_exit_code = self._ff.returncode
+                print(f"[SUP] FFmpeg died (code {self._ff.returncode}); will recover...")
+            self._restart_count += 1
+            self._launch_ffmpeg()
+
+    def stop_ffmpeg(self) -> None:
+        ff = self._ff
+        self._ff = None
+        if not ff:
+            return
+        try:
+            if ff.poll() is None:
+                ff.terminate()
+                try:
+                    ret = ff.wait(timeout=2)
+                    print(f"[FFMPEG] exited with code {ret}")
+                except Exception:
+                    ff.kill()
+        except Exception:
+            pass
+
+    # ---- internals ----
+    def _launch_ffmpeg(self) -> None:
+        self._try_set_camera_parm()
+
+        cmd_hw = self._build_ffmpeg_cmd("h264_v4l2m2m")
+        print("[FFMPEG] (HW) ", " ".join(shlex.quote(x) for x in cmd_hw))
+        ff = subprocess.Popen(cmd_hw)
+        time.sleep(1.0)
+
+        if ff.poll() is not None and ff.returncode != 0:
+            print(f"[FFMPEG] Hardware encoder failed (code {ff.returncode}). Trying software libx264...")
+            cmd_sw = self._build_ffmpeg_cmd("libx264")
+            print("[FFMPEG] (SW) ", " ".join(shlex.quote(x) for x in cmd_sw))
+            ff = subprocess.Popen(cmd_sw)
+            self._encoder_in_use = "libx264"
+        else:
+            self._encoder_in_use = "h264_v4l2m2m"
+
+        self._ff = ff
+
+    def _rx_loop(self) -> None:
+        self._ctrl_sock.settimeout(0.5)
+        print(f"[VID-CTRL] Listening for control on UDP 0.0.0.0:{self.ctrl_port} (RX-only; raw bytes)")
+        while not self._stop.is_set():
+            try:
+                data, addr = self._ctrl_sock.recvfrom(4096)
+                if not data:
+                    continue
+                self._last_cmd = data
+                self._last_cmd_from = addr
+                preview = data[:120].decode("utf-8", errors="replace").replace("\n", "\\n")
+                print(f"[VID-CTRL] <- {addr[0]}:{addr[1]} bytes={len(data)} head='{preview}'")
+
+                if self.on_control:
+                    try:
+                        self.on_control(data, addr)
+                    except Exception as e:
+                        print(f"[VID-CTRL] on_control error: {e}")
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if not self._stop.is_set():
+                    print(f"[VID-CTRL] recv error: {e}")
+                time.sleep(0.2)
 
 # ---------- Cursor-on-Target bridge (UDP) ----------
 from xml.etree import ElementTree as ET  # noqa: E402
@@ -398,7 +608,6 @@ class MavlinkInterface:
         self._running = True
         self.set_message_intervals()
         self.request_legacy_streams(rate_hz=5)
-        last_status = time.time()
         count = 0
         try:
             while self._running:
@@ -406,10 +615,6 @@ class MavlinkInterface:
                 if msg is not None:
                     count += 1
                     self._handle_message(msg, count)
-                if time.time() - last_status >= 5.0:
-                    last_status = time.time()
-                    ver = "v2" if self.master.mavlink20() else "v1"
-                    print(f"...listening ({ver}), received {count} messages")
                 time.sleep(0.002)
         except KeyboardInterrupt:
             print("Stopped.")
@@ -423,9 +628,7 @@ class MavlinkInterface:
         mtype = msg.get_type()
 
         if mtype == "HEARTBEAT":
-            print(f"[{count:06d}] HEARTBEAT sys={msg.get_srcSystem()} comp={msg.get_srcComponent()}")
             if self.cot_bridge:
-                # optional: send a simulated CoT on heartbeat as you did before
                 self.cot_bridge.simulate_global_position_int()
         elif mtype == "GLOBAL_POSITION_INT":
             lat = getattr(msg, "lat", 0) / 1e7
@@ -446,101 +649,14 @@ class MavlinkInterface:
         else:
             pass
 
-# ---------- FFmpeg launcher (UDP output) ----------
-def try_set_camera_parm(device: str, fps: int) -> None:
-    if have_cmd("v4l2-ctl"):
-        run_cmd(["v4l2-ctl", "-d", device, "--set-parm", str(fps)])
-
-def build_ffmpeg_cmd(dest_ip: str, udp_port: int, fps: int, w: int, h: int,
-                     device: str, input_format: str, encoder: str):
-    # Common TS-over-UDP packet sizing. Also set a UDP socket buffer to reduce drops.
-    url = f"udp://{dest_ip}:{udp_port}?pkt_size=1316&buffer_size=1048576"
-
-    v4l2_input = [
-        "-f", "v4l2",
-        "-input_format", input_format,
-        "-video_size", f"{w}x{h}",
-        "-framerate", str(fps),
-        "-i", device,
-    ]
-
-    if encoder == "h264_v4l2m2m":
-        enc = [
-            "-c:v", "h264_v4l2m2m",
-            "-pix_fmt", "nv12",
-            "-b:v", str(BITRATE_BPS),
-            "-maxrate", str(BITRATE_BPS),
-            "-bufsize", str(BITRATE_BPS // 2),
-            "-g", str(max(2, fps) * 2),
-            "-bf", "0",
-        ]
-    else:
-        enc = [
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-tune", "zerolatency",
-            "-threads", "2",
-            "-pix_fmt", "yuv420p",
-            "-b:v", str(BITRATE_BPS),
-            "-maxrate", str(BITRATE_BPS),
-            "-bufsize", str(BITRATE_BPS // 2),
-            "-g", str(max(2, fps) * 2),
-        ]
-
-    return [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-rtbufsize", "32M",
-        "-thread_queue_size", "256",
-        *v4l2_input,
-        *enc,
-        "-vsync", "cfr",
-        "-r", str(fps),
-        "-an",
-        "-f", "mpegts",
-        "-muxdelay", "0",
-        "-muxpreload", "0",
-        url
-    ]
-
-def launch_ffmpeg(dest_ip: str, udp_port: int, fps: int, w: int, h: int,
-                  device: str, input_format: str) -> subprocess.Popen:
-    try_set_camera_parm(device, fps)
-
-    base_hw = build_ffmpeg_cmd(dest_ip, udp_port, fps, w, h, device, input_format, "h264_v4l2m2m")
-    prio = (["nice", "-n", "10", "ionice", "-c2", "-n", "7"] if have_cmd("nice") and have_cmd("ionice") else [])
-    cmd_hw = prio + base_hw
-    print("[FFMPEG] (HW) ", " ".join(shlex.quote(x) for x in cmd_hw))
-    ff = subprocess.Popen(cmd_hw)
-    time.sleep(1.0)
-
-    if ff.poll() is not None and ff.returncode != 0:
-        print(f"[FFMPEG] Hardware encoder failed (code {ff.returncode}). Trying software libx264...")
-        base_sw = build_ffmpeg_cmd(dest_ip, udp_port, fps, w, h, device, input_format, "libx264")
-        cmd_sw = prio + base_sw
-        print("[FFMPEG] (SW) ", " ".join(shlex.quote(x) for x in cmd_sw))
-        ff = subprocess.Popen(cmd_sw)
-
-    return ff
-
-def stop_ffmpeg(ff: Optional[subprocess.Popen]):
-    if not ff:
-        return
-    try:
-        if ff.poll() is None:
-            ff.terminate()
-            try:
-                ret = ff.wait(timeout=2)
-                print(f"[FFMPEG] exited with code {ret}")
-            except Exception:
-                ff.kill()
-    except Exception:
-        pass
-
 # ---------- Supervisor: HB + Video + MAV/CoT ----------
 def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
-    print(f"Sending UDP heartbeat to {SIDE_A_IP}:{HEARTBEAT_PORT}, "
-          f"UDP video to {SIDE_A_IP}:{VIDEO_PORT}, "
-          f"and UDP CoT to {SIDE_A_IP}:{COT_PORT} ...")
+    print(
+        f"Sending UDP heartbeat to {SIDE_A_IP}:{HEARTBEAT_PORT}, "
+        f"UDP video to {SIDE_A_IP}:{VIDEO_PORT}, "
+        f"UDP CoT to {SIDE_A_IP}:{COT_PORT}, "
+        f"and listening for video control on local UDP:{VIDEO_CTRL_PORT} (RX-only)."
+    )
 
     if not os.path.exists(V4L2_DEVICE):
         print(f"[VIDEO] Device {V4L2_DEVICE} not found. Is the webcam connected?")
@@ -548,7 +664,6 @@ def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
 
     stop_event = threading.Event()
     hb: Optional[PayloadStatusSource] = None
-    ff: Optional[subprocess.Popen] = None
 
     # === CoT UDP sender + bridge ===
     cot_udp = UdpSender(SIDE_A_IP, COT_PORT)
@@ -577,10 +692,38 @@ def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
                 print("[MAV] worker error:", e)
         threading.Thread(target=mav_worker, daemon=True).start()
 
+    # === Video streamer (ffmpeg + control rx on :6000 only) ===
+    def on_video_control(data: bytes, addr: tuple[str, int]) -> None:
+        txt = data.decode("utf-8", errors="replace").strip().lower()
+        if txt in ("restart", "reboot_ffmpeg", "ffmpeg_restart"):
+            print("[VID-CTRL] Interpreting command as restart request (temporary behaviour).")
+            video.stop_ffmpeg()
+        elif txt in ("stop", "ffmpeg_stop"):
+            print("[VID-CTRL] Interpreting command as stop request (temporary behaviour).")
+            video.stop_ffmpeg()
+        # formats later; ignore everything else for now
+
+    video = VideoStreamer(
+        side_a_ip=SIDE_A_IP,
+        video_port=VIDEO_PORT,
+        ctrl_port=VIDEO_CTRL_PORT,
+        width=FRAME_WIDTH,
+        height=FRAME_HEIGHT,
+        fps=FRAME_RATE,
+        bitrate_bps=BITRATE_BPS,
+        v4l2_device=V4L2_DEVICE,
+        input_format=INPUT_FORMAT,
+        on_control=on_video_control,
+    )
+    video.start()
+
     def clean_exit(*_):
         stop_event.set()
         print("Stopping...")
-        stop_ffmpeg(ff)
+        try:
+            video.stop()
+        except Exception:
+            pass
         try:
             if hb:
                 hb.stop()
@@ -594,13 +737,21 @@ def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
             mav_iface.stop()
         except Exception:
             pass
+        try:
+            video.close()
+        except Exception:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, clean_exit)
     signal.signal(signal.SIGTERM, clean_exit)
 
-    print(f"Starting webcam stream: {FRAME_WIDTH}x{FRAME_HEIGHT}@{FRAME_RATE} "
-          f"from {V4L2_DEVICE} -> udp://{SIDE_A_IP}:{VIDEO_PORT}")
+    print(
+        f"Starting webcam stream: {FRAME_WIDTH}x{FRAME_HEIGHT}@{FRAME_RATE} "
+        f"from {V4L2_DEVICE} -> udp://{SIDE_A_IP}:{VIDEO_PORT}"
+    )
+    print(f"Video control: local UDP :{VIDEO_CTRL_PORT} (RX-only)")
+    print(f"Heartbeat: Side-A {SIDE_A_IP}:{HEARTBEAT_PORT}")
 
     retry_delay = 1.0
     while not stop_event.is_set():
@@ -613,21 +764,18 @@ def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
                 retry_delay = min(retry_delay * 2, 10.0)
                 continue
 
-        # Heartbeat (re)start
+        # Heartbeat (re)start (9000)
         if hb is None or not hb.is_running() or hb.has_fault():
             try:
                 if hb:
                     hb.stop()
             except Exception:
                 pass
-            hb = PayloadStatusSource(SIDE_A_IP, HEARTBEAT_PORT, interval_s=0.25)
+            hb = PayloadStatusSource(SIDE_A_IP, HEARTBEAT_PORT, interval_s=1.0)
             hb.start()
 
-        # (Re)start ffmpeg if needed
-        if ff is None or ff.poll() is not None:
-            if ff is not None:
-                print(f"[SUP] FFmpeg died (code {ff.returncode}); will recover...")
-            ff = launch_ffmpeg(SIDE_A_IP, VIDEO_PORT, FRAME_RATE, FRAME_WIDTH, FRAME_HEIGHT, V4L2_DEVICE, INPUT_FORMAT)
+        # Ensure ffmpeg running
+        video.ensure_running()
 
         # Basic pacing + light monitoring
         for _ in range(10):  # ~2.5s total
@@ -636,20 +784,22 @@ def supervisor_main(dev: str = DEFAULT_DEVICE, baud: int = DEFAULT_BAUD):
             if hb and hb.has_fault():
                 print("[SUP] Heartbeat fault detected; initiating recovery...")
                 break
-            if ff and ff.poll() is not None:
-                print(f"[SUP] FFmpeg exited (code {ff.returncode}); restarting...")
+            if video._ff is None or (video._ff is not None and video._ff.poll() is not None):
+                print("[SUP] FFmpeg not running; restarting...")
                 break
             time.sleep(0.25)
 
-        # If fault, bounce and try again
+        # If HB fault, bounce and try again
         if hb and hb.has_fault():
             try:
                 hb.stop()
             except Exception:
                 pass
             hb = None
-            stop_ffmpeg(ff)
-            ff = None
+            try:
+                video.stop_ffmpeg()
+            except Exception:
+                pass
             bounce_interface(IFACE)
             wait_for_gateway(GATEWAY_IP, timeout_s=25.0)
             time.sleep(1.0)

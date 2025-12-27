@@ -43,7 +43,7 @@ from android.os import Handler, Looper
 # ------------------ Config ------------------
 HOST_DEFAULT = "0.0.0.0"   # bind on all interfaces
 
-A_PEER_IP = "192.168.144.10"
+A_PEER_IP = "192.168.144.50"
 B_PEER_IP = "192.168.43.74"
 
 PORT_PAIRS = [

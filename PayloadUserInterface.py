@@ -2,24 +2,12 @@
 """
 GUI H.264/MPEG-TS viewer with side-by-side console.
 
-SIDE-B PORTS (as expected):
-- HEARTBEAT (text)  UDP :6001
+UPDATED PORTS (side-B):
+- VIDEO CTRL OUT    UDP :6001   (example repeated command sender)
 - VIDEO (mpegts)    UDP :7001
 - COT (xml/text)    UDP :8001   ---> forwarded to TCP 127.0.0.1:18087
+- STATUS (text)     UDP :9001
 
-This version:
-- STRIPS ALL UDP WAKEUP CODE
-- DELETES THE SNIFFER
-- PRINTS immediately when data is received on ANY port
-- FIXES Windows PyAV UDP open errors (Errno 10014) by NOT using av.open("udp://...").
-  Instead:
-    - a Python UDP socket binds to :7001
-    - received MPEG-TS datagrams are fed into PyAV via a file-like reader.
-- NEW: Connects to TCP server at 127.0.0.1:18087 and forwards any datagrams
-  arriving on COT_UDP_PORT to that TCP connection (with auto-reconnect).
-
-Requires:
-  pip install pyqt5 av opencv-python numpy
 """
 
 import sys
@@ -38,9 +26,10 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 # ------------------ Config ------------------
 # Side-B ports
-HEARTBEAT_UDP_PORT = 6001   # status text
-VIDEO_UDP_PORT     = 7001   # H.264 in MPEG-TS over UDP
-COT_UDP_PORT       = 8001   # Cursor-on-Target XML (or any text)
+VIDEO_CMD_UDP_PORT = 6001   # send video control commands here
+VIDEO_UDP_PORT     = 7001   # H.264 in MPEG-TS over UDP (unchanged)
+STATUS_UDP_PORT    = 9001   # status text (moved)
+COT_UDP_PORT       = 8001   # Cursor-on-Target XML (or any text) (unchanged)
 
 # Bind host (0.0.0.0 to listen on all interfaces)
 UDP_LISTEN_HOST = "192.168.43.74"
@@ -69,6 +58,24 @@ def safe_preview(b: bytes, max_len: int = 200) -> str:
     if len(s) > max_len:
         s = s[:max_len] + f"...(+{len(s)-max_len} more)"
     return s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
+# ---------- Simple shared state ----------
+class PeerState:
+    """
+    Stores the last peer IP we saw on heartbeat, so we can send commands back there.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hb_peer_ip: Optional[str] = None
+
+    def set_hb_peer(self, ip: str):
+        with self._lock:
+            self._hb_peer_ip = ip
+
+    def get_hb_peer(self) -> Optional[str]:
+        with self._lock:
+            return self._hb_peer_ip
 
 
 # ---------- Qt console redirection (optional) ----------
@@ -210,8 +217,6 @@ def udp_video_receiver(stop_event: threading.Event, pipe: UDPBytePipe, listen_ho
             if first:
                 first = False
                 print(f"[{ts()}] [VIDEO] <<< first datagram {len(data)}B from {peer[0]}:{peer[1]}")
-            # else:
-            #     print(f"[{ts()}] [VIDEO] <<< {len(data)}B from {peer[0]}:{peer[1]}")
 
             pipe.push(data)
     finally:
@@ -376,9 +381,10 @@ class DecoderThread(QtCore.QThread):
 
 
 # ---------- Straight UDP text listeners ----------
-def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int):
+def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int, peer_state: Optional[PeerState] = None):
     """
     Binds UDP :listen_port and prints received datagrams (safe preview).
+    If peer_state is provided, updates it with the peer IP (useful for sending commands back).
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -413,6 +419,9 @@ def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int)
             if not data:
                 continue
 
+            if peer_state is not None:
+                peer_state.set_hb_peer(peer[0])
+
             print(f"[{ts()}] [{label}] <<< {peer[0]}:{peer[1]}  {len(data)}B [{safe_preview(data)}]")
     finally:
         try:
@@ -420,6 +429,59 @@ def udp_text_listener(stop_event: threading.Event, label: str, listen_port: int)
         except Exception:
             pass
         print(f"[{ts()}] [{label}] Stopped.")
+
+
+# ---------- Video command sender ----------
+def video_command_sender(
+    stop_event: threading.Event,
+    peer_state: PeerState,
+    dest_port: int,
+    interval_s: float = 2.0,
+):
+    """
+    Periodically sends an example "video command" UDP datagram to dest_port.
+
+    Destination IP is learned from the last HEARTBEAT peer IP.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Optional: bind to a stable local address
+        sock.bind((UDP_LISTEN_HOST, 0))
+    except Exception:
+        # If binding fails, still try sending (OS will choose)
+        pass
+
+    counter = 0
+    print(f"[{ts()}] [VIDCMD] Sender enabled. Will transmit example commands to UDP :{dest_port} (dest IP learned from heartbeat).")
+
+    try:
+        while not stop_event.is_set():
+            ip = peer_state.get_hb_peer()
+            if not ip:
+                # Haven't seen heartbeat yet
+                if stop_event.wait(0.5):
+                    break
+                continue
+
+            # Example command payload (placeholder — you said you'll define formats later)
+            # Keep it simple and newline-terminated for easy debugging.
+            counter += 1
+            payload = f"VIDEO_CMD example #{counter} (placeholder)\n".encode("utf-8", errors="replace")
+
+            try:
+                sock.sendto(payload, (ip, int(dest_port)))
+                print(f"[{ts()}] [VIDCMD] >>> {ip}:{dest_port}  {len(payload)}B [{safe_preview(payload)}]")
+            except Exception as e:
+                print(f"[{ts()}] [VIDCMD] send error to {ip}:{dest_port}: {e}")
+
+            if stop_event.wait(float(interval_s)):
+                break
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        print(f"[{ts()}] [VIDCMD] Stopped.")
 
 
 # ---------- UDP COT -> TCP forwarder ----------
@@ -473,7 +535,6 @@ def udp_to_tcp_forwarder(
             return True
 
         now = time.time()
-        # avoid spamming logs if server is down
         if now - last_connect_log > 1.0:
             print(f"[{ts()}] [{label}] TCP connecting to {tcp_host}:{tcp_port}...")
             last_connect_log = now
@@ -482,17 +543,15 @@ def udp_to_tcp_forwarder(
         s.settimeout(2.0)
         try:
             s.connect((tcp_host, int(tcp_port)))
-        except Exception as e:
+        except Exception:
             try:
                 s.close()
             except Exception:
                 pass
-            # Keep trying in the main loop
             return False
 
-        # Connected
         try:
-            s.settimeout(None)  # blocking for sendall
+            s.settimeout(None)
         except Exception:
             pass
 
@@ -515,12 +574,9 @@ def udp_to_tcp_forwarder(
             if not data:
                 continue
 
-            # Print immediately on receive
             print(f"[{ts()}] [{label}] <<< {peer[0]}:{peer[1]}  {len(data)}B [{safe_preview(data)}]")
 
-            # Forward to TCP
             if not tcp_ensure_connected():
-                # No TCP yet; drop this packet (or you could buffer if you prefer)
                 print(f"[{ts()}] [{label}] TCP not connected; dropped {len(data)}B")
                 continue
 
@@ -529,7 +585,6 @@ def udp_to_tcp_forwarder(
             except Exception as e:
                 print(f"[{ts()}] [{label}] TCP send failed ({e}); reconnecting...")
                 tcp_close()
-                # Try once more immediately (optional)
                 if tcp_ensure_connected():
                     try:
                         tcp_sock.sendall(data)  # type: ignore[union-attr]
@@ -562,10 +617,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         header = QtWidgets.QLabel(
             f"<b>Listening (side-B):</b> "
-            f"HB UDP {UDP_LISTEN_HOST}:{HEARTBEAT_UDP_PORT} | "
+            f"Status UDP {UDP_LISTEN_HOST}:{STATUS_UDP_PORT} | "
             f"Video UDP {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT} | "
             f"CoT UDP {UDP_LISTEN_HOST}:{COT_UDP_PORT} "
-            f"&rarr; TCP {COT_TCP_HOST}:{COT_TCP_PORT}"
+            f"&rarr; TCP {COT_TCP_HOST}:{COT_TCP_PORT} | "
+            f"VideoCmd TX UDP :{VIDEO_CMD_UDP_PORT}"
         )
         outer_vbox.addWidget(header)
 
@@ -594,6 +650,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
 
+        self.peer_state = PeerState()
+
         # --- Video pipeline: UDP receiver -> pipe -> decoder ---
         self.video_pipe = UDPBytePipe(self.stop_event)
 
@@ -621,14 +679,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decoder.frame_ready.connect(self.video_widget.set_frame)
         self.decoder.start()
 
-        # --- HEARTBEAT listener on :6001 ---
+        # --- HEARTBEAT listener on :9001 (updates peer_state) ---
         hb_t = threading.Thread(
             target=udp_text_listener,
-            args=(self.stop_event, "HEARTBEAT", HEARTBEAT_UDP_PORT),
+            args=(self.stop_event, "STATUS", STATUS_UDP_PORT, self.peer_state),
             daemon=True
         )
         hb_t.start()
         self.threads.append(hb_t)
+
+        # --- VIDEO COMMAND SENDER: sends repeated example command to :6001 ---
+        cmd_t = threading.Thread(
+            target=video_command_sender,
+            args=(self.stop_event, self.peer_state, VIDEO_CMD_UDP_PORT),
+            daemon=True
+        )
+        cmd_t.start()
+        self.threads.append(cmd_t)
 
         # --- COT forwarder: UDP :8001 -> TCP 127.0.0.1:18087 ---
         cot_t = threading.Thread(
