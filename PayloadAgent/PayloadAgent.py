@@ -166,6 +166,7 @@ def supervisor_main():
         v4l2_device=V4L2_DEVICE,
         input_format=INPUT_FORMAT,
         on_control=on_video_control,
+        mavlink_iface=mav_iface
     )
     video.start()
 
