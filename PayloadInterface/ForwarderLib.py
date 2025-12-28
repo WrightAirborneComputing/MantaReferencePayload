@@ -132,7 +132,6 @@ class UDPTCPForwarder:
             )
 
             while not self.stop_event.is_set():
-                print(f"Checking {self.udp_host} {self.udp_port}")
                 try:
                     data, peer = udp_sock.recvfrom(self.max_dgram)
                 except socket.timeout:
