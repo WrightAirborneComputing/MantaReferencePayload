@@ -33,8 +33,8 @@ COT_PORT         = 8000                  # UDP CoT
 STATUS_PORT      = 9000                  # UDP status
 
 # ---------- Video settings (optimised for Pi but using MJPEG input) ----------
-FRAME_WIDTH      = 640
-FRAME_HEIGHT     = 480
+FRAME_WIDTH      = 1280
+FRAME_HEIGHT     = 720
 FRAME_RATE       = 8
 BITRATE_BPS      = 2_000_000
 V4L2_DEVICE      = "/dev/video0"
