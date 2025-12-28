@@ -10,9 +10,7 @@ UPDATED PORTS (side-B):
 """
 
 import sys
-import socket
 import threading
-from typing import Optional
 
 # --- Third-party ---
 import numpy as np
@@ -28,24 +26,21 @@ from PayloadStateLib import PayloadState
 from UtilsLib import ts
 
 # ------------------ Config ------------------
-# Side-B ports
-VIDEO_CMD_UDP_PORT = 6001   # send video control commands here
-VIDEO_UDP_PORT     = 7001   # H.264 in MPEG-TS over UDP
-STATUS_UDP_PORT    = 9001   # status text
-COT_UDP_PORT       = 8001   # Cursor-on-Target XML (or any text)
+VIDEO_CMD_UDP_PORT = 6001
+VIDEO_UDP_PORT     = 7001
+STATUS_UDP_PORT    = 9001
+COT_UDP_PORT       = 8001
 
-# Bind host (0.0.0.0 to listen on all interfaces)
 UDP_LISTEN_HOST = "192.168.43.74"
 
-# TCP target for forwarding COT
 COT_TCP_HOST = "127.0.0.1"
 COT_TCP_PORT = 18087
 
-# UDP buffer
 UDP_MAX_DGRAM = 65535
 
 WINDOW_TITLE = "MPEG-TS Viewer + Console"
 INITIAL_WIN_W, INITIAL_WIN_H = 1200, 700
+
 
 # ---------- Qt console redirection ----------
 class EmittingStream(QtCore.QObject):
@@ -57,6 +52,7 @@ class EmittingStream(QtCore.QObject):
 
     def flush(self):
         pass
+
 
 class ConsoleWidget(QtWidgets.QTextEdit):
     def __init__(self, parent=None):
@@ -102,10 +98,6 @@ class VideoWidget(QtWidgets.QLabel):
 
 # ---------- Video UDP -> file-like reader ----------
 class UDPBytePipe:
-    """
-    Thread-safe byte buffer that provides a blocking .read(n) method,
-    so PyAV/FFmpeg can read MPEG-TS bytes from it like a file.
-    """
     def __init__(self, stop_event: threading.Event):
         self._buf = bytearray()
         self._lock = threading.Lock()
@@ -145,8 +137,6 @@ class UDPBytePipe:
 # -------------- Main window ----------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
-
-        # Create display
         super().__init__()
         self.setWindowTitle(WINDOW_TITLE)
         self.resize(INITIAL_WIN_W, INITIAL_WIN_H)
@@ -168,12 +158,109 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
 
+        # ---- Video group with sliders + auto checkbox ----
         video_group = QtWidgets.QGroupBox("Video (H.264 / MPEG-TS)")
-        video_layout = QtWidgets.QVBoxLayout(video_group)
+        vg = QtWidgets.QGridLayout(video_group)
+        vg.setContentsMargins(8, 8, 8, 8)
+        vg.setHorizontalSpacing(6)
+        vg.setVerticalSpacing(6)
+
         self.video_widget = VideoWidget()
-        video_layout.addWidget(self.video_widget)
+        vg.addWidget(self.video_widget, 0, 0)
+
+        # Right-hand slider column: TILT + ZOOM (two vertical sliders side-by-side)
+        sliders_col = QtWidgets.QWidget()
+        sliders_col_layout = QtWidgets.QHBoxLayout(sliders_col)
+        sliders_col_layout.setContentsMargins(0, 0, 0, 0)
+        sliders_col_layout.setSpacing(8)
+
+        # --- Tilt group ---
+        tilt_group = QtWidgets.QWidget()
+        tilt_layout = QtWidgets.QVBoxLayout(tilt_group)
+        tilt_layout.setContentsMargins(0, 0, 0, 0)
+        tilt_layout.setSpacing(4)
+
+        tilt_label = QtWidgets.QLabel("Tilt")
+        tilt_label.setAlignment(QtCore.Qt.AlignHCenter)
+        tilt_layout.addWidget(tilt_label)
+
+        self.slider_y = QtWidgets.QSlider(QtCore.Qt.Vertical)
+        self.slider_y.setRange(-1000, 1000)
+        self.slider_y.setValue(0)
+        self.slider_y.setTickPosition(QtWidgets.QSlider.TicksRight)
+        self.slider_y.setTickInterval(250)
+        self.slider_y.setToolTip("Tilt (Y): up = +1, down = -1")
+        tilt_layout.addWidget(self.slider_y, stretch=1)
+
+        sliders_col_layout.addWidget(tilt_group)
+
+        # --- Zoom group ---
+        zoom_group = QtWidgets.QWidget()
+        zoom_layout = QtWidgets.QVBoxLayout(zoom_group)
+        zoom_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_layout.setSpacing(4)
+
+        zoom_label = QtWidgets.QLabel("Zoom")
+        zoom_label.setAlignment(QtCore.Qt.AlignHCenter)
+        zoom_layout.addWidget(zoom_label)
+
+        self.slider_zoom = QtWidgets.QSlider(QtCore.Qt.Vertical)
+        self.slider_zoom.setRange(-1000, 1000)
+        self.slider_zoom.setValue(0)
+        self.slider_zoom.setTickPosition(QtWidgets.QSlider.TicksRight)
+        self.slider_zoom.setTickInterval(250)
+        self.slider_zoom.setToolTip("Zoom: +1 / -1")
+        zoom_layout.addWidget(self.slider_zoom, stretch=1)
+
+        sliders_col_layout.addWidget(zoom_group)
+
+        vg.addWidget(sliders_col, 0, 1)
+
+        # Bottom horizontal slider (PAN)
+        bottom_row = QtWidgets.QWidget()
+        bottom_layout = QtWidgets.QVBoxLayout(bottom_row)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(4)
+
+        pan_label = QtWidgets.QLabel("Pan")
+        pan_label.setAlignment(QtCore.Qt.AlignHCenter)
+        bottom_layout.addWidget(pan_label)
+
+        self.slider_x = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider_x.setRange(-1000, 1000)
+        self.slider_x.setValue(0)
+        self.slider_x.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.slider_x.setTickInterval(250)
+        self.slider_x.setToolTip("Pan (X): right = +1, left = -1")
+        bottom_layout.addWidget(self.slider_x)
+
+        # Readout + Auto checkbox (below sliders, same column as right controls)
+        right_bottom = QtWidgets.QWidget()
+        right_bottom_layout = QtWidgets.QVBoxLayout(right_bottom)
+        right_bottom_layout.setContentsMargins(0, 0, 0, 0)
+        right_bottom_layout.setSpacing(6)
+
+        self.axes_readout = QtWidgets.QLabel("Pan=+0.00  Tlt=+0.00  Zm=+0.00  Auto=OFF")
+        self.axes_readout.setAlignment(QtCore.Qt.AlignCenter)
+        right_bottom_layout.addWidget(self.axes_readout)
+
+        self.auto_checkbox = QtWidgets.QCheckBox("Auto")
+        self.auto_checkbox.setToolTip("Enable/disable automatic mode in video control")
+        self.auto_checkbox.setChecked(False)
+        right_bottom_layout.addWidget(self.auto_checkbox, alignment=QtCore.Qt.AlignHCenter)
+
+        vg.addWidget(bottom_row, 1, 0)
+        vg.addWidget(right_bottom, 1, 1)
+
+        # let video expand, sliders stay skinny
+        vg.setColumnStretch(0, 1)
+        vg.setColumnStretch(1, 0)
+        vg.setRowStretch(0, 1)
+        vg.setRowStretch(1, 0)
+
         splitter.addWidget(video_group)
 
+        # ---- Console group ----
         console_group = QtWidgets.QGroupBox("Console (stdout / stderr)")
         console_layout = QtWidgets.QVBoxLayout(console_group)
         self.console = ConsoleWidget()
@@ -195,8 +282,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stderr_stream = EmittingStream()
         self.stdout_stream.text_ready.connect(self.console.append_text)
         self.stderr_stream.text_ready.connect(self.console.append_text)
-        # SJW sys.stdout = self.stdout_stream  # type: ignore
-        # sys.stderr = self.stderr_stream  # type: ignore
+        sys.stdout = self.stdout_stream  # type: ignore
+        sys.stderr = self.stderr_stream  # type: ignore
 
         # Shared peer state (learned from STATUS listener)
         self.payload_state = PayloadState()
@@ -204,73 +291,122 @@ class MainWindow(QtWidgets.QMainWindow):
         # --- Video pipeline: UDP receiver -> pipe -> decoder ---
         self.video_pipe = UDPBytePipe(self.stop_event)
 
-        self.video_rx = VideoUDPReceiver(self.stop_event,"VIDEO",self.video_pipe,UDP_LISTEN_HOST,VIDEO_UDP_PORT,UDP_MAX_DGRAM)
+        self.video_rx = VideoUDPReceiver(
+            self.stop_event,
+            "VIDEO",
+            self.video_pipe,
+            UDP_LISTEN_HOST,
+            VIDEO_UDP_PORT,
+            UDP_MAX_DGRAM,
+        )
         self.video_rx.start()
 
-        self.decoder = DecoderThread(self.video_pipe,self,f"MPEG-TS over UDP (bound {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT})")
+        self.decoder = DecoderThread(
+            self.video_pipe,
+            self,
+            f"MPEG-TS over UDP (bound {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT})",
+        )
         self.decoder.frame_ready.connect(self.video_widget.set_frame)
         self.decoder.start()
 
         # --- STATUS listener on :9001 (updates payload_state) ---
         self.status_listener = UDPTextListener(
-            self.stop_event,"STATUS",
-            UDP_LISTEN_HOST,STATUS_UDP_PORT,self.payload_state,UDP_MAX_DGRAM)
+            self.stop_event, "STATUS",
+            UDP_LISTEN_HOST, STATUS_UDP_PORT,
+            self.payload_state, UDP_MAX_DGRAM,
+        )
         self.status_listener.start()
 
-        # --- VIDEO COMMAND SENDER: sends repeated example command to :6001 ---
+        # --- VIDEO COMMAND SENDER: driven by sliders/checkbox ---
         self.cmd_sender = VideoCommandSender(
-            self.stop_event,"VIDCMD",
+            self.stop_event, "VIDCMD",
             self.payload_state,
-            UDP_LISTEN_HOST,VIDEO_CMD_UDP_PORT,0.5)
+            UDP_LISTEN_HOST, VIDEO_CMD_UDP_PORT,
+            0.25,
+        )
         self.cmd_sender.start()
+
+        # Wire controls after cmd_sender exists
+        self.slider_x.valueChanged.connect(self._on_axes_changed)
+        self.slider_y.valueChanged.connect(self._on_axes_changed)
+        self.slider_zoom.valueChanged.connect(self._on_zoom_changed)
+        self.auto_checkbox.toggled.connect(self._on_auto_toggled)
+
+        # push initial values
+        self._on_axes_changed()
+        self._on_zoom_changed()
+        self._on_auto_toggled(self.auto_checkbox.isChecked())
 
         # --- COT forwarder: UDP :8001 -> TCP 127.0.0.1:18087 ---
         self.cot_forwarder = UDPTCPForwarder(
-            self.stop_event,"COT",
-            UDP_LISTEN_HOST,COT_UDP_PORT,COT_TCP_HOST,COT_TCP_PORT,UDP_MAX_DGRAM)
+            self.stop_event, "COT",
+            UDP_LISTEN_HOST, COT_UDP_PORT,
+            COT_TCP_HOST, COT_TCP_PORT,
+            UDP_MAX_DGRAM,
+        )
         self.cot_forwarder.start()
 
         print(f"[{ts()}] UI ready. Close the window to quit.\n")
+
+    def _update_readout(self):
+        x = self.slider_x.value() / 1000.0
+        y = -(self.slider_y.value() / 1000.0)  # invert Y
+        z = self.slider_zoom.value() / 1000.0
+        auto = self.auto_checkbox.isChecked()
+        self.axes_readout.setText(
+            f"Pan={x:+0.2f}  Tlt={y:+0.2f}  Zm={z:+0.2f}  Auto={'ON' if auto else 'OFF'}"
+        )
+
+    def _on_axes_changed(self):
+        x = self.slider_x.value() / 1000.0
+        y = -(self.slider_y.value() / 1000.0)
+        self._update_readout()
+        try:
+            self.cmd_sender.set_axes(x, y)
+        except Exception as e:
+            print(f"[{ts()}] [UI] cmd_sender.set_axes failed: {e}")
+
+    def _on_zoom_changed(self):
+        z = self.slider_zoom.value() / 1000.0
+        self._update_readout()
+        try:
+            self.cmd_sender.set_zoom(z)
+        except Exception as e:
+            print(f"[{ts()}] [UI] cmd_sender.set_zoom failed: {e}")
+
+    def _on_auto_toggled(self, checked: bool):
+        self._update_readout()
+        # Expect VideoCommandSender to implement set_auto(bool)
+        try:
+            self.cmd_sender.set_auto(bool(checked))
+        except Exception as e:
+            print(f"[{ts()}] [UI] cmd_sender.set_auto failed: {e}")
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
             self.stop_event.set()
 
-            # stop helpers to unblock quickly
-            try:
-                self.video_rx.stop()
-            except Exception:
-                pass
-            try:
-                self.status_listener.stop()
-            except Exception:
-                pass
-            try:
-                self.cmd_sender.stop()
-            except Exception:
-                pass
-            try:
-                self.cot_forwarder.stop()
-            except Exception:
-                pass
+            try: self.video_rx.stop()
+            except Exception: pass
+            try: self.status_listener.stop()
+            except Exception: pass
+            try: self.cmd_sender.stop()
+            except Exception: pass
+            try: self.cot_forwarder.stop()
+            except Exception: pass
 
-            try:
-                self.video_pipe.close()
-            except Exception:
-                pass
+            try: self.video_pipe.close()
+            except Exception: pass
 
             if self.decoder.isRunning():
                 self.decoder.stop()
                 self.decoder.wait(2000)
 
-            # join background threads
             self.video_rx.join(1.0)
             self.status_listener.join(1.0)
             self.cmd_sender.join(1.0)
             self.cot_forwarder.join(1.0)
 
-        except Exception:
-            pass
         finally:
             sys.stdout = sys.__stdout__
             sys.stderr = sys.__stderr__
