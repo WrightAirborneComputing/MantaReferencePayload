@@ -226,9 +226,6 @@ def supervisor_main():
             status_src = PayloadStatusSource(SIDE_A_IP, STATUS_PORT, 1.0)
             status_src.start()
 
-        # Ensure ffmpeg running
-        video.ensure_running()
-
         # Basic pacing + light monitoring
         for _ in range(10):  # ~2.5s total
             if stop_event.is_set():
@@ -241,7 +238,7 @@ def supervisor_main():
                 break
             time.sleep(0.25)
 
-        # If HB fault, bounce and try again
+        # If connection fault, bounce and try again
         if status_src and status_src.has_fault():
             try:
                 status_src.stop()
