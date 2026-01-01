@@ -213,7 +213,7 @@ def supervisor_main():
             bounce_interface(IFACE)
             waited = wait_for_gateway(GATEWAY_IP, timeout_s=25.0)
             if not waited:
-                time.sleep(min(retry_delay, 5.0))
+                time.sleep(min(retry_delay, 2.0))
                 retry_delay = min(retry_delay * 2, 10.0)
                 continue
 
