@@ -9,10 +9,11 @@ Incoming JSON example (UDP ctrl_port):
   {"pan":0.0,"tilt":-0.0,"zoom":0.0,"auto":false}
 
 Notes:
-- This version strips out ALL hardware encoding attempts (no h264_v4l2m2m).
+- SW encoder only (libx264).
 - Includes ensure_running() so existing supervisor code can keep calling it.
 - Optional fisheye undistortion:
-    Put your calibration K and D in FISHEYE_K and FISHEYE_D below (see section).
+    Put your calibration K and D in FISHEYE_K and FISHEYE_D below.
+- If auto==True, applies tilt compensation from vehicle pitch assuming 180° fisheye FOV (±90°).
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import cv2
 import numpy as np
 
 from MavlinkInterfaceLib import MavlinkInterface
+
 
 # ----------------- helpers -----------------
 
@@ -50,12 +52,9 @@ def safe_preview(b: bytes, n: int = 160) -> str:
 
 # ----------------- fisheye calibration (PUT K & D HERE) -----------------
 # If you haven't calibrated yet, leave USE_FISHEYE_UNDISTORT=False.
-# Once you have calibration results, set USE_FISHEYE_UNDISTORT=True
-# and paste your K and D values here.
 
 USE_FISHEYE_UNDISTORT = True
 
-# K: 3x3 camera matrix (np.float32)
 FISHEYE_K = np.array(
     [[600.0,   0.0, 640.0],
      [  0.0, 600.0, 360.0],
@@ -63,7 +62,6 @@ FISHEYE_K = np.array(
     dtype=np.float32
 )
 
-# D: fisheye distortion coefficients (k1,k2,k3,k4) (np.float32)
 FISHEYE_D = np.array([-0.05, 0.01, 0.0, 0.0], dtype=np.float32)
 
 
@@ -72,7 +70,7 @@ FISHEYE_D = np.array([-0.05, 0.01, 0.0, 0.0], dtype=np.float32)
 @dataclass
 class VideoControl:
     pan: float = 0.0   # [-1..+1]
-    tilt: float = 0.0  # [-1..+1] (positive = UP in your UI convention)
+    tilt: float = 0.0  # [-1..+1] (positive = UP)
     zoom: float = 0.0  # [-1..+1]
     auto: bool = False
 
@@ -98,9 +96,8 @@ def decode_video_cmd(payload: Union[bytes, str]) -> VideoControl:
     except Exception:
         return VideoControl()
 
-    # Keep signs "as sent" by the UI:
-    # - If your UI already inverts tilt so up => +, then don't invert here.
-    # - Your UI earlier sent tilt as-is, so we keep it as-is.
+    # NOTE: you previously inverted tilt here; keeping that behavior as-is.
+    # If you want "up" on UI to be +tilt, make sure the sign convention matches your sender.
     return VideoControl(
         pan=float(d.get("pan", 0.0)),
         tilt=-float(d.get("tilt", 0.0)),
@@ -131,9 +128,6 @@ class VideoStreamer:
 
         # compatibility arg (some callers still pass it)
         input_format: Optional[str] = None,
-
-        fisheye_fov_deg: float = 180.0,
-        output_fov_deg: float = 45.0,
         output_size: Optional[Tuple[int, int]] = None,
 
         # zoom response tuning
@@ -142,9 +136,6 @@ class VideoStreamer:
 
         # Optional callback on control packets
         on_control: Optional[Callable[[bytes, Tuple[str, int]], None]] = None,
-
-        # Supervisor restart shaping
-        ffmpeg_restart_backoff_s: float = 0.5,
     ) -> None:
         self.video_port = int(video_port)
         self.ctrl_port = int(ctrl_port)
@@ -156,16 +147,21 @@ class VideoStreamer:
         self.side_a_ip = side_a_ip
         self.input_format = input_format  # unused but accepted
         self.on_control = on_control
+
         self.mavlink_interface = mavlink_iface
 
-        self.fisheye_fov_deg = float(fisheye_fov_deg)
-        self.output_fov_deg = float(output_fov_deg)
+        self.fisheye_fov_deg = 170.0
+        self.output_fov_deg = 45.0
         self.out_w, self.out_h = output_size or (self.width, self.height)
 
         self.zoom_in_max = float(zoom_in_max)
         self.zoom_out_max = float(zoom_out_max)
 
-        self.ffmpeg_restart_backoff_s = float(ffmpeg_restart_backoff_s)
+        self.ffmpeg_restart_backoff_s = 0.5
+
+        self.pitch_smoothing_alpha = 0.90
+        self._pitch_filt_rad = 0.0
+        self._pitch_filt_ready = False
 
         self._stop = threading.Event()
         self._ctl = VideoControl()
@@ -259,8 +255,6 @@ class VideoStreamer:
             with self._ctl_lock:
                 self._ctl = ctl
 
-            # print(f"[{ts()}] [VID-CTRL] <- {addr[0]}:{addr[1]} {safe_preview(data)}")
-
             if self.on_control:
                 try:
                     self.on_control(data, addr)
@@ -271,14 +265,64 @@ class VideoStreamer:
         with self._ctl_lock:
             return self._ctl
 
+    # ---------- auto-tilt from pitch ----------
+
+    def _get_pitch_rad_filtered(self) -> Optional[float]:
+        """
+        Returns filtered pitch in radians, or None if no pitch available.
+        Requires MavlinkInterface to implement get_pitch_rad().
+        """
+        try:
+            p = self.mavlink_interface.get_pitch_rad()
+        except Exception:
+            return None
+
+        if p is None:
+            return None
+
+        # low-pass filter
+        a = clamp(self.pitch_smoothing_alpha, 0.0, 0.995)
+        if not self._pitch_filt_ready:
+            self._pitch_filt_rad = float(p)
+            self._pitch_filt_ready = True
+        else:
+            self._pitch_filt_rad = (a * self._pitch_filt_rad) + ((1.0 - a) * float(p))
+
+        return self._pitch_filt_rad
+
+    def _apply_auto_tilt_if_enabled(self, ctl: VideoControl) -> VideoControl:
+        """
+        If ctl.auto is True, adjust tilt based on vehicle pitch.
+
+        Assumption: total fisheye FOV = 180° => half-angle = 90°.
+        We convert pitch_deg to a normalized tilt fraction:
+            pitch_frac = pitch_deg / 90
+        and apply it with a sign so that:
+            pitch up (+) => view moves down (compensation)
+        Our crop uses:
+            cy = 0.5 - tilt * max_off_y
+        So "move down" means more positive cy => tilt must go MORE NEGATIVE.
+        Therefore:
+            tilt_eff = ctl.tilt - gain * pitch_frac
+        """
+        if not ctl.auto:
+            return ctl
+
+        pitch_rad = self._get_pitch_rad_filtered()
+        if pitch_rad is None:
+            return ctl
+
+        auto_tilt_gain = 2.0
+        pitch_deg = float(pitch_rad) * (180.0 / 3.141592653589793)
+        half_fov = max(1e-6, self.fisheye_fov_deg / 2.0)
+        pitch_frac = clamp(pitch_deg / half_fov, -1.0, 1.0)
+        tilt_eff = ctl.tilt - (auto_tilt_gain * pitch_frac)
+        # print("CtrlTilt[%.2f] AcPitch[%.2f] TiltEff[%.2f]" % (ctl.tilt,pitch_deg,tilt_eff))
+        return VideoControl(pan=ctl.pan, tilt=clamp(tilt_eff, -1.0, 1.0), zoom=ctl.zoom, auto=ctl.auto)
+
     # ---------- crop math ----------
 
     def _compute_crop_wh(self, zoom: float) -> Tuple[int, int]:
-        """
-        Compute crop width/height in pixels based on:
-          base scale = output_fov / fisheye_fov
-          zoom in => smaller crop, zoom out => bigger crop
-        """
         base = self.output_fov_deg / self.fisheye_fov_deg
         base = clamp(base, 0.02, 1.0)
 
@@ -293,20 +337,13 @@ class VideoStreamer:
         return cw, ch
 
     def _crop_frame(self, frame: np.ndarray, ctl: VideoControl) -> np.ndarray:
-        """
-        Pan/tilt tries to access as much of the fisheye image as possible.
-        The maximum pan/tilt is limited only by keeping the crop inside the frame.
-        """
         h, w = frame.shape[:2]
         cw, ch = self._compute_crop_wh(ctl.zoom)
 
-        # how far can centre move (in fraction) before crop hits border?
         max_off_x = max(0.0, 0.5 - cw / (2.0 * w))
         max_off_y = max(0.0, 0.5 - ch / (2.0 * h))
 
-        # Full range mapping: pan/tilt = +/-1 maps to full allowable offset
         cx = int((0.5 + ctl.pan * max_off_x) * w)
-        # tilt +1 = up => smaller y
         cy = int((0.5 - ctl.tilt * max_off_y) * h)
 
         x1 = int(clamp(cx - cw // 2, 0, w - cw))
@@ -326,8 +363,6 @@ class VideoStreamer:
             K = FISHEYE_K.astype(np.float32).copy()
             D = FISHEYE_D.astype(np.float32).reshape(4, 1).copy()
             R = np.eye(3, dtype=np.float32)
-
-            # You can tweak the newK / balance later; start with same K.
             newK = K.copy()
 
             self._undist_map1, self._undist_map2 = cv2.fisheye.initUndistortRectifyMap(
@@ -362,7 +397,6 @@ class VideoStreamer:
     def _ff_cmd_sw(self) -> list[str]:
         url = f"udp://{self.side_a_ip}:{self.video_port}?pkt_size=1316&buffer_size=1048576"
 
-        # Important: put encoding args *before* the output URL.
         cmd = [
             "ffmpeg",
             "-hide_banner", "-loglevel", "warning",
@@ -396,7 +430,6 @@ class VideoStreamer:
         return prio + cmd
 
     def _start_ffmpeg(self) -> None:
-        # Backoff so a supervisor loop doesn't spawn relentlessly
         now = time.time()
         if (now - self._last_ffmpeg_start_ts) < self.ffmpeg_restart_backoff_s:
             return
@@ -442,16 +475,12 @@ class VideoStreamer:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
-        # Start ffmpeg once
         self._start_ffmpeg()
-
         last_ts = 0.0
 
         while not self._stop.is_set():
-            # keep ffmpeg alive
             self.ensure_running()
 
-            # throttle to fps
             if time.time() - last_ts < self._frame_period:
                 time.sleep(0.002)
                 continue
@@ -473,6 +502,8 @@ class VideoStreamer:
             frame = self._undistort_if_enabled(frame)
 
             ctl = self._get_ctl()
+            ctl = self._apply_auto_tilt_if_enabled(ctl)  # <-- NEW: pitch-comp tilt if auto
+
             out = self._crop_frame(frame, ctl)
 
             p = self._ff
@@ -492,4 +523,3 @@ class VideoStreamer:
             except Exception:
                 pass
             self._cap = None
-
