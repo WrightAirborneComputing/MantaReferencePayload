@@ -18,8 +18,7 @@ import cv2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # Internal
-from VideoLib import VideoUDPReceiver, VideoCommandSender
-from DecoderThreadLib import DecoderThread
+from VideoLib import VideoUDPReceiver, VideoCommandSender, DecoderThread
 from ForwarderLib import UDPTCPForwarder
 from TextListenerLib import UDPTextListener
 from PayloadStateLib import PayloadState
