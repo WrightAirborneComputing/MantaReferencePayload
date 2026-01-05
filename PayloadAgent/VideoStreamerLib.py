@@ -14,6 +14,12 @@ Notes:
 - Optional fisheye undistortion:
     Put your calibration K and D in FISHEYE_K and FISHEYE_D below.
 - If auto==True, applies tilt compensation from vehicle pitch assuming 180° fisheye FOV (±90°).
+
+Latency-focused changes (sender):
+- OpenCV capture buffering reduced (CAP_PROP_BUFFERSIZE=1 where supported).
+- ffmpeg flags for low latency: -fflags nobuffer, -flags low_delay, -flush_packets 1, -max_delay 0
+- x264 tuned for low latency: zerolatency, no B-frames, short GOP, repeat headers, aud
+- mpegts flags to push headers and minimize buffering
 """
 
 from __future__ import annotations
@@ -87,6 +93,9 @@ def decode_video_cmd(payload: Union[bytes, str]) -> VideoControl:
     """
     Decodes {"pan":..,"tilt":..,"zoom":..,"auto":..} to VideoControl.
     Returns safe defaults on parse failure.
+
+    NOTE: tilt is inverted here (keeps your current behavior).
+    If you want UI "up" to be +tilt, ensure your sender matches this convention.
     """
     if isinstance(payload, (bytes, bytearray)):
         payload = payload.decode("utf-8", errors="replace")
@@ -96,8 +105,6 @@ def decode_video_cmd(payload: Union[bytes, str]) -> VideoControl:
     except Exception:
         return VideoControl()
 
-    # NOTE: you previously inverted tilt here; keeping that behavior as-is.
-    # If you want "up" on UI to be +tilt, make sure the sign convention matches your sender.
     return VideoControl(
         pan=float(d.get("pan", 0.0)),
         tilt=-float(d.get("tilt", 0.0)),
@@ -130,12 +137,23 @@ class VideoStreamer:
         input_format: Optional[str] = None,
         output_size: Optional[Tuple[int, int]] = None,
 
+        # virtual gimbal settings
+        fisheye_fov_deg: float = 180.0,
+        output_fov_deg: float = 45.0,
+
         # zoom response tuning
         zoom_in_max: float = 0.75,
         zoom_out_max: float = 0.90,
 
         # Optional callback on control packets
         on_control: Optional[Callable[[bytes, Tuple[str, int]], None]] = None,
+
+        # restart shaping
+        ffmpeg_restart_backoff_s: float = 0.6,
+
+        # latency / encoding tuning
+        gop_seconds: float = 1.0,           # keyframe interval in seconds (smaller = lower latency / faster recovery)
+        x264_threads: int = 2,              # keep small on Pi
     ) -> None:
         self.video_port = int(video_port)
         self.ctrl_port = int(ctrl_port)
@@ -150,15 +168,19 @@ class VideoStreamer:
 
         self.mavlink_interface = mavlink_iface
 
-        self.fisheye_fov_deg = 170.0
-        self.output_fov_deg = 45.0
+        self.fisheye_fov_deg = float(fisheye_fov_deg)
+        self.output_fov_deg = float(output_fov_deg)
         self.out_w, self.out_h = output_size or (self.width, self.height)
 
         self.zoom_in_max = float(zoom_in_max)
         self.zoom_out_max = float(zoom_out_max)
 
-        self.ffmpeg_restart_backoff_s = 0.5
+        self.ffmpeg_restart_backoff_s = float(ffmpeg_restart_backoff_s)
 
+        self.gop_seconds = float(gop_seconds)
+        self.x264_threads = int(x264_threads)
+
+        # pitch filter for auto-tilt
         self.pitch_smoothing_alpha = 0.90
         self._pitch_filt_rad = 0.0
         self._pitch_filt_ready = False
@@ -233,7 +255,8 @@ class VideoStreamer:
         if self._stop.is_set():
             return
         if self._ff is None or self._ff.poll() is not None:
-            print("[SUP] FFmpeg not running; starting...")
+            # keep this quiet-ish; supervisor may call often
+            # print("[SUP] FFmpeg not running; starting...")
             self._start_ffmpeg()
 
     # ---------- control ----------
@@ -254,6 +277,9 @@ class VideoStreamer:
             ctl = decode_video_cmd(data)
             with self._ctl_lock:
                 self._ctl = ctl
+
+            # Uncomment for debugging:
+            # print(f"[{ts()}] [VID-CTRL] <- {addr[0]}:{addr[1]} {safe_preview(data)}")
 
             if self.on_control:
                 try:
@@ -280,7 +306,6 @@ class VideoStreamer:
         if p is None:
             return None
 
-        # low-pass filter
         a = clamp(self.pitch_smoothing_alpha, 0.0, 0.995)
         if not self._pitch_filt_ready:
             self._pitch_filt_rad = float(p)
@@ -295,15 +320,9 @@ class VideoStreamer:
         If ctl.auto is True, adjust tilt based on vehicle pitch.
 
         Assumption: total fisheye FOV = 180° => half-angle = 90°.
-        We convert pitch_deg to a normalized tilt fraction:
-            pitch_frac = pitch_deg / 90
-        and apply it with a sign so that:
-            pitch up (+) => view moves down (compensation)
-        Our crop uses:
-            cy = 0.5 - tilt * max_off_y
-        So "move down" means more positive cy => tilt must go MORE NEGATIVE.
-        Therefore:
-            tilt_eff = ctl.tilt - gain * pitch_frac
+        Normalize pitch to [-1..+1] by dividing by 90°.
+        Compensation sign:
+          pitch up (+) => we want to look down => tilt becomes more NEGATIVE.
         """
         if not ctl.auto:
             return ctl
@@ -312,13 +331,20 @@ class VideoStreamer:
         if pitch_rad is None:
             return ctl
 
-        auto_tilt_gain = 2.0
         pitch_deg = float(pitch_rad) * (180.0 / 3.141592653589793)
-        half_fov = max(1e-6, self.fisheye_fov_deg / 2.0)
+        half_fov = max(1e-6, self.fisheye_fov_deg / 2.0)  # should be 90 for 180 total
         pitch_frac = clamp(pitch_deg / half_fov, -1.0, 1.0)
+
+        # gain 1.0 => 1:1 mapping of pitch_frac to tilt fraction
+        auto_tilt_gain = 1.0
         tilt_eff = ctl.tilt - (auto_tilt_gain * pitch_frac)
-        # print("CtrlTilt[%.2f] AcPitch[%.2f] TiltEff[%.2f]" % (ctl.tilt,pitch_deg,tilt_eff))
-        return VideoControl(pan=ctl.pan, tilt=clamp(tilt_eff, -1.0, 1.0), zoom=ctl.zoom, auto=ctl.auto)
+
+        return VideoControl(
+            pan=ctl.pan,
+            tilt=clamp(tilt_eff, -1.0, 1.0),
+            zoom=ctl.zoom,
+            auto=ctl.auto,
+        )
 
     # ---------- crop math ----------
 
@@ -337,6 +363,10 @@ class VideoStreamer:
         return cw, ch
 
     def _crop_frame(self, frame: np.ndarray, ctl: VideoControl) -> np.ndarray:
+        """
+        Pan/tilt tries to access as much of the fisheye image as possible.
+        The maximum pan/tilt is limited only by keeping the crop inside the frame.
+        """
         h, w = frame.shape[:2]
         cw, ch = self._compute_crop_wh(ctl.zoom)
 
@@ -395,30 +425,53 @@ class VideoStreamer:
         return shutil.which(cmd) is not None
 
     def _ff_cmd_sw(self) -> list[str]:
-        url = f"udp://{self.side_a_ip}:{self.video_port}?pkt_size=1316&buffer_size=1048576"
+        # UDP output: keep small buffers, and ask ffmpeg to flush packets aggressively.
+        url = f"udp://{self.side_a_ip}:{self.video_port}?pkt_size=1316&buffer_size=65536"
+
+        # GOP / keyframes: shorter GOP can reduce end-to-end delay and improve recovery.
+        gop = max(2, int(round(self.fps * max(0.25, self.gop_seconds))))
+
+        # x264 params: no bframes, repeat headers, aud helps some decoders
+        x264_params = f"bframes=0:ref=1:scenecut=0:repeat-headers=1:aud=1:keyint={gop}:min-keyint={gop}"
 
         cmd = [
             "ffmpeg",
             "-hide_banner", "-loglevel", "warning",
+
+            # low-latency demux/processing behavior
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-flush_packets", "1",
+            "-max_delay", "0",
+
+            # raw frames in
             "-f", "rawvideo",
             "-pix_fmt", "bgr24",
             "-s", f"{self.out_w}x{self.out_h}",
             "-r", str(self.fps),
             "-i", "pipe:0",
+
             "-an",
+
+            # encoder
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-tune", "zerolatency",
+            "-threads", str(max(1, self.x264_threads)),
             "-pix_fmt", "yuv420p",
             "-b:v", str(self.bitrate_bps),
             "-maxrate", str(self.bitrate_bps),
-            "-bufsize", str(max(1, self.bitrate_bps // 2)),
-            "-g", str(max(2, self.fps) * 2),
-            "-keyint_min", str(max(2, self.fps) * 2),
+            "-bufsize", str(max(1, self.bitrate_bps // 4)),  # smaller VBV buffer => lower latency (may risk quality)
+            "-g", str(gop),
+            "-keyint_min", str(gop),
             "-sc_threshold", "0",
+            "-x264-params", x264_params,
+
+            # mux
             "-f", "mpegts",
             "-muxdelay", "0",
             "-muxpreload", "0",
+            "-mpegts_flags", "+resend_headers",
             url,
         ]
 
@@ -440,8 +493,8 @@ class VideoStreamer:
         try:
             cmd = self._ff_cmd_sw()
             print(f"[{ts()}] [FFMPEG] (SW) " + " ".join(cmd))
-            p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            time.sleep(0.25)
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+            time.sleep(0.2)
             if p.poll() is None:
                 self._ff = p
                 print(f"[{ts()}] [FFMPEG] Running (sw).")
@@ -472,6 +525,13 @@ class VideoStreamer:
 
     def _capture_loop(self) -> None:
         self._cap = cv2.VideoCapture(self.v4l2_device)
+
+        # Minimize capture buffering if backend supports it.
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
@@ -481,8 +541,9 @@ class VideoStreamer:
         while not self._stop.is_set():
             self.ensure_running()
 
+            # throttle to fps
             if time.time() - last_ts < self._frame_period:
-                time.sleep(0.002)
+                time.sleep(0.001)
                 continue
             last_ts = time.time()
 
@@ -492,7 +553,7 @@ class VideoStreamer:
 
             ok, frame = self._cap.read()
             if not ok or frame is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
             h, w = frame.shape[:2]
@@ -502,7 +563,7 @@ class VideoStreamer:
             frame = self._undistort_if_enabled(frame)
 
             ctl = self._get_ctl()
-            ctl = self._apply_auto_tilt_if_enabled(ctl)  # <-- NEW: pitch-comp tilt if auto
+            ctl = self._apply_auto_tilt_if_enabled(ctl)
 
             out = self._crop_frame(frame, ctl)
 
@@ -523,3 +584,45 @@ class VideoStreamer:
             except Exception:
                 pass
             self._cap = None
+
+
+# ------------------ standalone test ------------------
+
+if __name__ == "__main__":
+    # NOTE: this assumes you create and start MavlinkInterface elsewhere in your real app.
+    # For a quick local run you can pass a stub with get_pitch_rad() returning None.
+
+    class _StubMav:
+        def get_pitch_rad(self):
+            return None
+
+    vs = VideoStreamer(
+        video_port=7001,
+        ctrl_port=6001,
+        width=1280,
+        height=720,
+        fps=8,
+        bitrate_bps=2_000_000,
+        v4l2_device="/dev/video0",
+        side_a_ip="192.168.144.11",
+        mavlink_iface=_StubMav(),     # replace with real MavlinkInterface in PayloadAgent
+        input_format="mjpeg",         # accepted, unused
+        output_size=(1280, 720),
+
+        fisheye_fov_deg=180.0,
+        output_fov_deg=45.0,
+
+        # latency knobs (adjust if needed)
+        gop_seconds=0.8,
+        x264_threads=2,
+    )
+
+    try:
+        vs.start()
+        while True:
+            time.sleep(1.0)
+            vs.ensure_running()
+    except KeyboardInterrupt:
+        print("Stopping...")
+    finally:
+        vs.stop()
