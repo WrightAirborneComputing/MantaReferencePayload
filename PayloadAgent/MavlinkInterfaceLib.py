@@ -25,11 +25,18 @@ DEFAULT_REQ_INTERVALS_HZ: Dict[str, int] = {
 # Where we persist the last known valid GPS fix
 LAST_GPS_FILE = "/home/pi/ReferencePayload/last_gps_fix.json"
 
+# SITL UDP endpoint
+SITL_UDP_IP = "172.22.32.1"
+SITL_UDP_PORT = 14580
+SITL_UDP_CONN = f"udp:{SITL_UDP_IP}:{SITL_UDP_PORT}"
+
 
 class MavlinkInterface:
-    def __init__(self, device, baud, cot_bridge):
+    def __init__(self, device, baud, cot_bridge, sitl_mode: bool = False):
         self.device = device
         self.baud = baud
+        self.sitl_mode = bool(sitl_mode)
+
         self.req_intervals_hz = dict(DEFAULT_REQ_INTERVALS_HZ)
         self.source_system = 255
         self.autoreconnect = True
@@ -130,20 +137,30 @@ class MavlinkInterface:
             self._last_fix = (lat_deg, lon_deg, alt_m)
             self._write_fix_file(lat_deg, lon_deg, alt_m)
         # Light logging
-        print(f"[GPS] Stored last fix from {source}: lat={lat_deg:.7f} lon={lon_deg:.7f} alt={alt_m:.1f}m")
+        # print(f"[GPS] Stored last fix from {source}: lat={lat_deg:.7f} lon={lon_deg:.7f} alt={alt_m:.1f}m")
 
     def _get_last_fix(self) -> Tuple[float, float, float]:
         return self._read_fix_file()
 
     # ---- mavlink plumbing ----
     def open(self):
-        print(f"Opening {self.device} at {self.baud} baud (RX on GPIO15)")
-        self.master = mavutil.mavlink_connection(
-            self.device,
-            baud=self.baud,
-            autoreconnect=self.autoreconnect,
-            source_system=self.source_system,
-        )
+        if self.sitl_mode:
+            # SITL: connect via UDP
+            print(f"Opening MAVLink SITL UDP connection: {SITL_UDP_CONN}")
+            self.master = mavutil.mavlink_connection(
+                SITL_UDP_CONN,
+                autoreconnect=self.autoreconnect,
+                source_system=self.source_system,
+            )
+        else:
+            # Real HW: serial
+            print(f"Opening {self.device} at {self.baud} baud (RX on GPIO15)")
+            self.master = mavutil.mavlink_connection(
+                self.device,
+                baud=self.baud,
+                autoreconnect=self.autoreconnect,
+                source_system=self.source_system,
+            )
 
     def wait_heartbeat(self, timeout):
         print("Waiting for HEARTBEAT...")
@@ -229,11 +246,6 @@ class MavlinkInterface:
         if not self.cot_bridge:
             return
 
-        # Try to read lat/lon/alt from the msg in the usual MAVLink units
-        lat_deg = None
-        lon_deg = None
-        alt_m = None
-
         mtype = msg.get_type()
         if mtype == "GPS_RAW_INT":
             lat_deg = getattr(msg, "lat", 0) / 1e7
@@ -241,34 +253,24 @@ class MavlinkInterface:
             alt_m = getattr(msg, "alt", 0) / 1000.0
             sats  = getattr(msg, "satellites_visible", 0)
 
-            if lat_deg is not None and lon_deg is not None and self._is_valid_runtime_fix(lat_deg, lon_deg, sats):
-                # Good fix: pass through original msg
+            if self._is_valid_runtime_fix(lat_deg, lon_deg, sats):
                 self.cot_bridge.process_global_position_int(msg)
                 return
 
-            # Bad/zero fix: use stored last fix (or 0/0 if that's all we have)
             last_lat, last_lon, last_alt = self._get_last_fix()
-
-            # Build a small proxy that looks like GLOBAL_POSITION_INT for downstream code
             proxy = SimpleNamespace(
                 lat=int(last_lat * 1e7),
                 lon=int(last_lon * 1e7),
                 alt=int(last_alt * 1000.0),
-                vz=0,  # cm/s (unknown)
+                vz=0,
                 get_type=lambda: "GPS_RAW_INT",
             )
-
-            # Optional log so you know fallback is happening
-            # print(f"[GPS] No valid fix in {source}; using stored fix lat={last_lat:.7f} lon={last_lon:.7f}")
             self.cot_bridge.process_global_position_int(proxy)
-        # if
-    # def
 
     def _handle_message(self, msg: mavutil.mavlink.MAVLink_message, count: int):
         mtype = msg.get_type()
 
         if mtype == "ATTITUDE":
-            # ---- store pitch ----
             pitch = getattr(msg, "pitch", None)
             if pitch is not None:
                 with self._att_lock:
@@ -284,13 +286,9 @@ class MavlinkInterface:
 
             print(f"[{count:06d}] GPS_RAW_INT fix={fix} lat={lat_deg:.7f} lon={lon_deg:.7f} sat={sats}")
 
-            # Store only if:
-            #  - valid runtime fix, AND
-            #  - at least 6 satellites
             if self._is_valid_runtime_fix(lat_deg, lon_deg, sats):
                 self._update_last_fix(lat_deg, lon_deg, alt_m, "GPS_RAW_INT")
 
-            # Also acceptable source for CoT (with fallback)
             self._send_cot_using_msg_or_last_fix(msg, "GPS_RAW_INT")
 
         else:

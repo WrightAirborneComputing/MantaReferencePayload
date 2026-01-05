@@ -11,6 +11,7 @@ UPDATED PORTS (side-B):
 
 import sys
 import threading
+import argparse
 
 # --- Third-party ---
 import numpy as np
@@ -30,7 +31,8 @@ VIDEO_UDP_PORT     = 7001
 STATUS_UDP_PORT    = 9001
 COT_UDP_PORT       = 8001
 
-UDP_LISTEN_HOST = "192.168.43.74"
+# Default (non-SITL) listen host
+UDP_LISTEN_HOST_DEFAULT = "192.168.43.74"
 
 COT_TCP_HOST = "127.0.0.1"
 COT_TCP_PORT = 18087
@@ -39,6 +41,24 @@ UDP_MAX_DGRAM = 65535
 
 WINDOW_TITLE = "MPEG-TS Viewer + Console"
 INITIAL_WIN_W, INITIAL_WIN_H = 1200, 700
+
+
+# ------------------ CLI ------------------
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(add_help=True)
+    p.add_argument(
+        "-sitl", "--sitl",
+        action="store_true",
+        help="Enable SITL mode (bind/listen on 127.0.0.1)."
+    )
+    # Optional override if you ever want it
+    p.add_argument(
+        "--host",
+        default=None,
+        help=f"Override UDP listen host (default: {UDP_LISTEN_HOST_DEFAULT}, SITL: 127.0.0.1)."
+    )
+    args, _unknown = p.parse_known_args(argv)
+    return args
 
 
 # ---------- Qt console redirection ----------
@@ -135,8 +155,11 @@ class UDPBytePipe:
 
 # -------------- Main window ----------------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, listen_host: str, sitl_mode: bool = False):
         super().__init__()
+        self.listen_host = str(listen_host)
+        self.sitl_mode = bool(sitl_mode)
+
         self.setWindowTitle(WINDOW_TITLE)
         self.resize(INITIAL_WIN_W, INITIAL_WIN_H)
 
@@ -147,11 +170,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         header = QtWidgets.QLabel(
             f"<b>Listening (side-B):</b> "
-            f"Status UDP {UDP_LISTEN_HOST}:{STATUS_UDP_PORT} | "
-            f"Video UDP {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT} | "
-            f"CoT UDP {UDP_LISTEN_HOST}:{COT_UDP_PORT} "
+            f"Status UDP {self.listen_host}:{STATUS_UDP_PORT} | "
+            f"Video UDP {self.listen_host}:{VIDEO_UDP_PORT} | "
+            f"CoT UDP {self.listen_host}:{COT_UDP_PORT} "
             f"&rarr; TCP {COT_TCP_HOST}:{COT_TCP_PORT} | "
-            f"VideoCmd TX UDP :{VIDEO_CMD_UDP_PORT}"
+            f"VideoCmd TX UDP :{VIDEO_CMD_UDP_PORT} "
+            f"{'(SITL)' if self.sitl_mode else ''}"
         )
         outer_vbox.addWidget(header)
 
@@ -167,13 +191,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.video_widget = VideoWidget()
         vg.addWidget(self.video_widget, 0, 0)
 
-        # Right-hand slider column: TILT + ZOOM (two vertical sliders side-by-side)
         sliders_col = QtWidgets.QWidget()
         sliders_col_layout = QtWidgets.QHBoxLayout(sliders_col)
         sliders_col_layout.setContentsMargins(0, 0, 0, 0)
         sliders_col_layout.setSpacing(8)
 
-        # --- Tilt group ---
         tilt_group = QtWidgets.QWidget()
         tilt_layout = QtWidgets.QVBoxLayout(tilt_group)
         tilt_layout.setContentsMargins(0, 0, 0, 0)
@@ -193,7 +215,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         sliders_col_layout.addWidget(tilt_group)
 
-        # --- Zoom group ---
         zoom_group = QtWidgets.QWidget()
         zoom_layout = QtWidgets.QVBoxLayout(zoom_group)
         zoom_layout.setContentsMargins(0, 0, 0, 0)
@@ -215,7 +236,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         vg.addWidget(sliders_col, 0, 1)
 
-        # Bottom horizontal slider (PAN)
         bottom_row = QtWidgets.QWidget()
         bottom_layout = QtWidgets.QVBoxLayout(bottom_row)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
@@ -233,7 +253,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider_x.setToolTip("Pan (X): right = +1, left = -1")
         bottom_layout.addWidget(self.slider_x)
 
-        # Readout + Auto checkbox (below sliders, same column as right controls)
         right_bottom = QtWidgets.QWidget()
         right_bottom_layout = QtWidgets.QVBoxLayout(right_bottom)
         right_bottom_layout.setContentsMargins(0, 0, 0, 0)
@@ -251,7 +270,6 @@ class MainWindow(QtWidgets.QMainWindow):
         vg.addWidget(bottom_row, 1, 0)
         vg.addWidget(right_bottom, 1, 1)
 
-        # let video expand, sliders stay skinny
         vg.setColumnStretch(0, 1)
         vg.setColumnStretch(1, 0)
         vg.setRowStretch(0, 1)
@@ -259,7 +277,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter.addWidget(video_group)
 
-        # ---- Console group ----
         console_group = QtWidgets.QGroupBox("Console (stdout / stderr)")
         console_layout = QtWidgets.QVBoxLayout(console_group)
         self.console = ConsoleWidget()
@@ -273,10 +290,8 @@ class MainWindow(QtWidgets.QMainWindow):
         outer_vbox.addWidget(splitter, stretch=1)
         self.setCentralWidget(central)
 
-        # Stop-signal shared across components
         self.stop_event = threading.Event()
 
-        # Redirect stdout/stderr to UI
         self.stdout_stream = EmittingStream()
         self.stderr_stream = EmittingStream()
         self.stdout_stream.text_ready.connect(self.console.append_text)
@@ -284,17 +299,15 @@ class MainWindow(QtWidgets.QMainWindow):
         sys.stdout = self.stdout_stream  # type: ignore
         sys.stderr = self.stderr_stream  # type: ignore
 
-        # Shared peer state (learned from STATUS listener)
         self.payload_state = PayloadState()
 
-        # --- Video pipeline: UDP receiver -> pipe -> decoder ---
         self.video_pipe = UDPBytePipe(self.stop_event)
 
         self.video_rx = VideoUDPReceiver(
             self.stop_event,
             "VIDEO",
             self.video_pipe,
-            UDP_LISTEN_HOST,
+            self.listen_host,
             VIDEO_UDP_PORT,
             UDP_MAX_DGRAM,
         )
@@ -303,43 +316,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.decoder = DecoderThread(
             self.video_pipe,
             self,
-            f"MPEG-TS over UDP (bound {UDP_LISTEN_HOST}:{VIDEO_UDP_PORT})",
+            f"MPEG-TS over UDP (bound {self.listen_host}:{VIDEO_UDP_PORT})",
         )
         self.decoder.frame_ready.connect(self.video_widget.set_frame)
         self.decoder.start()
 
-        # --- STATUS listener on :9001 (updates payload_state) ---
         self.status_listener = UDPTextListener(
             self.stop_event, "STATUS",
-            UDP_LISTEN_HOST, STATUS_UDP_PORT,
+            self.listen_host, STATUS_UDP_PORT,
             self.payload_state, UDP_MAX_DGRAM,
         )
         self.status_listener.start()
 
-        # --- VIDEO COMMAND SENDER: driven by sliders/checkbox ---
         self.cmd_sender = VideoCommandSender(
             self.stop_event, "VIDCMD",
             self.payload_state,
-            UDP_LISTEN_HOST, VIDEO_CMD_UDP_PORT,
+            self.listen_host, VIDEO_CMD_UDP_PORT,
             0.25,
         )
         self.cmd_sender.start()
 
-        # Wire controls after cmd_sender exists
         self.slider_x.valueChanged.connect(self._on_axes_changed)
         self.slider_y.valueChanged.connect(self._on_axes_changed)
         self.slider_zoom.valueChanged.connect(self._on_zoom_changed)
         self.auto_checkbox.toggled.connect(self._on_auto_toggled)
 
-        # push initial values
         self._on_axes_changed()
         self._on_zoom_changed()
         self._on_auto_toggled(self.auto_checkbox.isChecked())
 
-        # --- COT forwarder: UDP :8001 -> TCP 127.0.0.1:18087 ---
         self.cot_forwarder = UDPTCPForwarder(
             self.stop_event, "COT",
-            UDP_LISTEN_HOST, COT_UDP_PORT,
+            self.listen_host, COT_UDP_PORT,
             COT_TCP_HOST, COT_TCP_PORT,
             UDP_MAX_DGRAM,
         )
@@ -349,7 +357,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _update_readout(self):
         x = self.slider_x.value() / 1000.0
-        y = -(self.slider_y.value() / 1000.0)  # invert Y
+        y = -(self.slider_y.value() / 1000.0)
         z = self.slider_zoom.value() / 1000.0
         auto = self.auto_checkbox.isChecked()
         self.axes_readout.setText(
@@ -375,7 +383,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_auto_toggled(self, checked: bool):
         self._update_readout()
-        # Expect VideoCommandSender to implement set_auto(bool)
         try:
             self.cmd_sender.set_auto(bool(checked))
         except Exception as e:
@@ -415,9 +422,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
 # ------------------ Entry -------------------
 def main():
+    args = parse_cli(sys.argv[1:])
+
+    sitl = bool(args.sitl)
+    if args.host:
+        listen_host = args.host.strip()
+    else:
+        listen_host = "127.0.0.1" if sitl else UDP_LISTEN_HOST_DEFAULT
+
+    if sitl:
+        print(f"[{ts()}] [MODE] SITL enabled (-sitl). Binding/listening on {listen_host}")
+
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
+    win = MainWindow(listen_host=listen_host, sitl_mode=sitl)
     win.show()
     sys.exit(app.exec_())
 

@@ -14,6 +14,7 @@ import signal
 import shutil
 import threading
 import subprocess
+import argparse
 from typing import Optional, Dict, Callable
 
 from VideoStreamerLib    import VideoStreamer
@@ -35,7 +36,7 @@ STATUS_PORT      = 9000                  # UDP status
 # ---------- Video settings (optimised for Pi but using MJPEG input) ----------
 FRAME_WIDTH      = 1280
 FRAME_HEIGHT     = 720
-FRAME_RATE       = 8
+FRAME_RATE       = 10
 BITRATE_BPS      = 2_000_000
 V4L2_DEVICE      = "/dev/video0"
 INPUT_FORMAT     = "mjpeg"
@@ -43,6 +44,23 @@ INPUT_FORMAT     = "mjpeg"
 # ---------- MAVLink settings ----------
 DEFAULT_MAVLINK_DEVICE   = "/dev/serial0"
 DEFAULT_MAVLINK_BAUD     = 115200
+
+# ---------- Global flag set by CLI ----------
+SITL_MODE = False
+
+
+# ---------- CLI ----------
+def parse_cli(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument(
+        "-sitl", "--sitl",
+        action="store_true",
+        help="Enable SITL mode (sets SITL_MODE flag true)."
+    )
+    # Ignore unknown args so this script won't break if launched with extra flags
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
 
 # ---------- Utilities ----------
 def run_cmd(cmd: list[str]) -> int:
@@ -101,24 +119,39 @@ def wait_for_gateway(ip: str, timeout_s: float = 40.0, interval_s: float = 1.0) 
         time.sleep(interval_s)
     print("[RECOVERY] Gateway still unreachable after wait."); return False
 
+
 # ---------- Supervisor: HB + Video + MAV/CoT ----------
-def supervisor_main():
+def supervisor_main(sitl: bool = False):
+    global SITL_MODE
+    SITL_MODE = bool(sitl)
+
+    # In SITL, force all IPs to localhost
+    side_a_ip  = "127.0.0.1" if SITL_MODE else SIDE_A_IP
+    gateway_ip = "127.0.0.1" if SITL_MODE else GATEWAY_IP
+
+    if SITL_MODE:
+        print("[MODE] SITL enabled (-sitl). Forcing IPs to 127.0.0.1.")
+
     print(
-        f"Sending UDP heartbeat to {SIDE_A_IP}:{STATUS_PORT}, "
-        f"UDP video to {SIDE_A_IP}:{VIDEO_PORT}, "
-        f"UDP CoT to {SIDE_A_IP}:{COT_PORT}, "
+        f"Sending UDP heartbeat to {side_a_ip}:{STATUS_PORT}, "
+        f"UDP video to {side_a_ip}:{VIDEO_PORT}, "
+        f"UDP CoT to {side_a_ip}:{COT_PORT}, "
         f"and listening for video control on local UDP:{VIDEO_CTRL_PORT} (RX-only)."
     )
 
-    if not os.path.exists(V4L2_DEVICE):
-        print(f"[VIDEO] Device {V4L2_DEVICE} not found. Is the webcam connected?")
-        return
+    # - skip /dev/video0 check in SITL
+    if not SITL_MODE:
+        if not os.path.exists(V4L2_DEVICE):
+            print(f"[VIDEO] Device {V4L2_DEVICE} not found. Is the webcam connected?")
+            return
+    else:
+        print(f"[VIDEO] SITL: skipping V4L2 device existence check ({V4L2_DEVICE}).")
 
     stop_event = threading.Event()
     status_src = None
 
     # === CoT UDP sender + bridge ===
-    cot_udp = UdpSender(SIDE_A_IP, COT_PORT)
+    cot_udp = UdpSender(side_a_ip, COT_PORT)
     cot_bridge = CursorOnTargetBridge(
         uid="AAV-Payload-1",
         cot_type="a-f-A-M-F-Q",
@@ -129,11 +162,11 @@ def supervisor_main():
     )
 
     # === MAVLink setup ===
-    mav_iface = MavlinkInterface(DEFAULT_MAVLINK_DEVICE, DEFAULT_MAVLINK_BAUD, cot_bridge)
+    mav_iface = MavlinkInterface(DEFAULT_MAVLINK_DEVICE, DEFAULT_MAVLINK_BAUD, cot_bridge, sitl_mode=SITL_MODE)
     try:
         mav_iface.open()
     except Exception as e:
-        print(f"[MAV] Could not open {dev}: {e}")
+        print(f"[MAV] Could not open {DEFAULT_MAVLINK_DEVICE}: {e}")
         print("Tip: add your user to 'dialout' group or run with sudo.")
     else:
         def mav_worker():
@@ -156,7 +189,7 @@ def supervisor_main():
         # formats later; ignore everything else for now
 
     video = VideoStreamer(
-        side_a_ip=SIDE_A_IP,
+        side_a_ip=side_a_ip,
         video_port=VIDEO_PORT,
         ctrl_port=VIDEO_CTRL_PORT,
         width=FRAME_WIDTH,
@@ -201,21 +234,24 @@ def supervisor_main():
 
     print(
         f"Starting webcam stream: {FRAME_WIDTH}x{FRAME_HEIGHT}@{FRAME_RATE} "
-        f"from {V4L2_DEVICE} -> udp://{SIDE_A_IP}:{VIDEO_PORT}"
+        f"from {V4L2_DEVICE} -> udp://{side_a_ip}:{VIDEO_PORT}"
     )
     print(f"Video control: local UDP :{VIDEO_CTRL_PORT} (RX-only)")
-    print(f"Heartbeat: Side-A {SIDE_A_IP}:{STATUS_PORT}")
+    print(f"Heartbeat: Side-A {side_a_ip}:{STATUS_PORT}")
 
     retry_delay = 1.0
     while not stop_event.is_set():
-        if not ping_once(GATEWAY_IP):
-            print("[SUP] Gateway ping failed; starting recovery...")
-            bounce_interface(IFACE)
-            waited = wait_for_gateway(GATEWAY_IP, timeout_s=25.0)
-            if not waited:
-                time.sleep(min(retry_delay, 2.0))
-                retry_delay = min(retry_delay * 2, 10.0)
-                continue
+
+        # Skip gateway ping + interface bounce in SITL
+        if not SITL_MODE:
+            if not ping_once(gateway_ip):
+                print("[SUP] Gateway ping failed; starting recovery...")
+                bounce_interface(IFACE)
+                waited = wait_for_gateway(gateway_ip, timeout_s=25.0)
+                if not waited:
+                    time.sleep(min(retry_delay, 2.0))
+                    retry_delay = min(retry_delay * 2, 10.0)
+                    continue
 
         # Status (re)start (9000)
         if status_src is None or not status_src.is_running() or status_src.has_fault():
@@ -224,7 +260,7 @@ def supervisor_main():
                     status_src.stop()
             except Exception:
                 pass
-            status_src = PayloadStatusSource(SIDE_A_IP, STATUS_PORT, 1.0)
+            status_src = PayloadStatusSource(side_a_ip, STATUS_PORT, 1.0)
             status_src.start()
 
         # Basic pacing + light monitoring
@@ -235,7 +271,8 @@ def supervisor_main():
                 print("[SUP] Heartbeat fault detected; initiating recovery...")
                 break
             if video._ff is None or (video._ff is not None and video._ff.poll() is not None):
-                print("[SUP] FFmpeg not running; restarting...")
+                # print("[SUP] FFmpeg not running; restarting...")
+                print(".", end="", flush=True)
                 break
             time.sleep(0.25)
 
@@ -250,14 +287,17 @@ def supervisor_main():
                 video.stop_ffmpeg()
             except Exception:
                 pass
-            bounce_interface(IFACE)
-            wait_for_gateway(GATEWAY_IP, timeout_s=25.0)
+            if not SITL_MODE:
+                bounce_interface(IFACE)
+                wait_for_gateway(gateway_ip, timeout_s=25.0)
             time.sleep(1.0)
             retry_delay = 1.0
             continue
 
     clean_exit()
 
-# ---------- CLI ----------
+
+# ---------- Main ----------
 if __name__ == "__main__":
-    supervisor_main()
+    args = parse_cli(sys.argv[1:])
+    supervisor_main(sitl=args.sitl)
